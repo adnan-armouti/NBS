@@ -70,6 +70,13 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   node_1 = camera yaw by assumption (sweep was flat, `octonet_mount_yaw.py`).
 - OctoNet's own loader code: GitHub `aiot-lab/OctoNet` (`dataset_loader.py`).
 
+## OctoNet in the 4DPS copy (Task B, done 2026-10-27)
+`--dataset octonet` is registered (`mm4DPS/__init__.py`: SFCW `Radar`, `OCTONET` dataset). Stages through the standard
+entries: `python -m mm4DPS.reconstruction scaffold --dataset octonet --rec <rec> --output-dir <dir>` and
+`… person-sequence --dataset octonet --sequence <rec> --output-dir <dir>`; sequence access `mm4DPS.octonet.OctoNetSequence`;
+heads `mm4DPS/octonet_heads.py` (`selftest`); static fit `python -m mm4DPS.octonet_fit fit-static`. Contracts, results and
+open items: `4DPS/docs/OCTONET.md`. The 4DPS `chain.py` is not used for OctoNet.
+
 ## Key docs
 `docs/node_migration_plan.md` (how the node is set up), `docs/prompts/viz_octonet_prompt.md`,
 `docs/prompts/port_4dps_prompt.md` (the adaptation plan), `docs/WRITE_UP.md` (obstacle log).

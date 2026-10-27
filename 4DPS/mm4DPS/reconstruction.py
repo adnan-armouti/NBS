@@ -42,7 +42,7 @@ from mm4DPS import (
 
 from numpy.lib.format import open_memmap
 
-import argparse
+import argparse, sys
 
 import matplotlib
 from pathlib import Path
@@ -897,6 +897,10 @@ def main_scaffold() -> None:
 
 
 def _entry_scaffold():
+        from mm4DPS import dataset_from_argv
+        if dataset_from_argv().name == "octonet":
+            from mm4DPS import octonet
+            return octonet.main_scaffold()     # RGB-D (3 nodes) + MoCap, no Depth-Anything: mm4DPS/octonet.py
         main_scaffold()
 
 # ----------------------------------------------------------------------
@@ -1630,6 +1634,11 @@ def run_person_sequence(args: argparse.Namespace) -> dict:
     from mm4DPS.scene import vertex_normals
     from mm4DPS import Install
     dataset = Dataset.select(args.dataset)
+    if dataset.name == "octonet":
+        # no RGB camera and no GVHMR: the person is SMPL fitted to the 20-joint OptiTrack skeleton, already in
+        # the MoCap world frame (mm4DPS/octonet_person.py writes person_sequence.npz + person_metadata.json)
+        from mm4DPS.octonet_person import run_octonet_person
+        return run_octonet_person(str(args.sequence), Path(args.output_dir), device=args.device)
     vertices_camera = np.load(args.vertices)["vertices_camera"].astype(np.float64)
     if dataset.name == "rtpose":
         from mm4DPS.data import RTPoseSequence
@@ -2000,6 +2009,17 @@ def make_parser_person_sequence() -> argparse.ArgumentParser:
 
 
 def _entry_person_sequence():
+    from mm4DPS import dataset_from_argv
+    if dataset_from_argv().name == "octonet":
+        # the HuPR/RT-Pose parser demands a GVHMR dump; OctoNet has none
+        p = argparse.ArgumentParser(description="OctoNet person stage: SMPL fitted to the OptiTrack skeleton")
+        p.add_argument("--dataset"); p.add_argument("--sequence", required=True, help="14-digit recording stamp")
+        p.add_argument("--output-dir", type=Path, required=True); p.add_argument("--device", default="cuda:0")
+        args = p.parse_args([a for a in sys.argv[1:] if a != "person-sequence"])   # dispatch() strips the command
+        Dataset.select("octonet")
+        result = run_person_sequence(args)
+        print(json.dumps({k: v for k, v in (result or {}).items() if not hasattr(v, "shape")}, indent=1, default=str)[:3000])
+        return
     print(json.dumps(run_person_sequence(make_parser_person_sequence().parse_args()), indent=2))
 
 

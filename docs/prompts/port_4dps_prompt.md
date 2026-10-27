@@ -5,6 +5,7 @@
 > from `nbs/`). Node positions come from the OptiTrack CSV rigid bodies (`nbs/preprocessing/octonet_scene.py`), not only
 > the paper; depth PNGs are 8-bit 0–10 m; RGB video is not shipped. Paths: `reference_code/NBS/...` → `nbs/...`,
 > `reference_code/4DPS/` → `4DPS/`, `viz/` → this repo's `viz/`. See `CLAUDE.md` and `docs/node_migration_plan.md`.
+> **Task A and Task B were executed 2026-10-27**: see `4DPS/docs/OCTONET.md` for what was built and what is open.
 
 > Self-contained task prompt for a fresh Claude Code session. Project: `/home/adnan/Desktop/NBS`.
 > Read `CLAUDE.md` and `WRITE_UP.md` (obstacles #15–#19b) first. This prompt contains BOTH the copy

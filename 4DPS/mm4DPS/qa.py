@@ -615,6 +615,11 @@ def _entry_window_check(argv: list[str]) -> int:
     worst = 0.0
     report: dict = {"dataset": dataset.name, "fft_window": fft_window_kind(), "radars": {}}
     for radar in dataset.radars:
+        if radar.modulation != "fmcw":
+            report["radars"][radar.name] = {"skipped": f"{radar.modulation} radar: no chirp/TDM chain to check here; "
+                                                       "validated by `python -m mm4DPS.octonet_heads selftest`"}
+            print(f"{radar.name}: {radar.modulation} radar, FMCW chain check skipped")
+            continue
         K, L = radar.samples, radar.loops
         rx_pos, tx_pos = radar.rotated_positions()          # half-wavelength units, (az, el)
         wavelength = 299_792_458.0 / radar.carrier_hz

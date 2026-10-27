@@ -59,6 +59,10 @@ Tx pitch assumptions are verified (mount-yaw check).
 - `wifi_gt_vs_rendered.png` — per receiver: GT |CSI| (frame + temporal mean, both antennas) and CIR; rendered `wifi_forward.render_csi` with schematic Tx/Rx. GT notches are HT40 null/pilot subcarriers; 40 MHz gives 7.5 m taps, so only the first 1–2 are informative. Rx-4 (NLOS) GT is not visibly suppressed.
 - `captions.txt`
 
+## Task B (4DPS copy adapted to OctoNet): `4DPS/docs/OCTONET.md`
+- `geometry_init/person_smpl_fit.png` — SMPL fitted to the OptiTrack skeleton (walk 2.34 cm, sit 3.41 cm mean joint RMSE), the person stage.
+- `render_vs_gt/sfcw_fit_static.png` — first static SFCW fit on the calibrated scaffold: loss 1.157 → 0.627 (held recording 1.140 → 0.653).
+
 ## Open items these figures expose
 1. **Vayyar element layout.** The direct-coupling energy over the 20×20 Tx×Rx grid is smooth (so the 400 pairs are a 20×20 grid) but does not follow a uniform-pitch L-array: the Tx elements sit in two sub-groups (`mount_yaw_sweep.png`, `octonet_mount_yaw.py`). The azimuth/RA axis in `vayyar_radar_config` is therefore unverified; obtain the IMAGEVK-74 element coordinates (vSDK / datasheet in the old NBS `pdfs/IMAGEVK-74.pdf`) before any RA-based loss. Until then, fit SFCW on the pair-wise range profiles only (`kind='logmag'`).
 1b. Radar/UWB mount yaw on node_1: **unmeasurable** from the static returns. The SFCW loss vs yaw is a flat basin from about −100° to +120° around the camera yaw (it only rises when the radar faces the wall behind it); the UWB prototype curve has no peak above z = 3. Both keep the camera yaw, level, recorded as an assumption in `extrinsics.json`. Also exposed: `render_sfcw_pairs` has no antenna element pattern (a cos^p pattern was assumed for the sweep).

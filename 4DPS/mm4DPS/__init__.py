@@ -65,6 +65,7 @@ DEPTH_ANYTHING_REPO = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
 DEFAULT_CUDA_HOME = "/usr/local/cuda-12.8"
 DEFAULT_DATASET_ROOT = "/home/adnan/Documents/Data/HuPR"
 DEFAULT_RTPOSE_ROOT = "/data/datasets/RT-Pose"
+DEFAULT_OCTONET_ROOT = "/data/mmsd/datasets/OctoNet/OctoNet-upload"   # the node; the workstation copy was deleted
 
 
 def _env_path(variable: str, fallback: str) -> Path:
@@ -388,7 +389,7 @@ HUPR_NEAR_FIELD_M = 0.5
 # many channels each has or where its config lives asks the Dataset; nothing
 # below this comment is HuPR-specific except the two instances at the bottom.
 # ----------------------------------------------------------------------
-DATASETS = ("hupr", "rtpose")
+DATASETS = ("hupr", "rtpose", "octonet")
 DATASET_ENV = "MM4DPS_DATASET"
 N_ANGLE_OVERRIDE_ENV = "MM4DPS_N_ANGLE_OVERRIDE"
 TRAINING_ARRAY_ENV = "MM4DPS_TRAINING_ARRAY"
@@ -443,6 +444,14 @@ class Radar:
     #: radar, where tx_order carries the same information.
     tx_slots: tuple[int, ...] | None = None
     loop_slots: int | None = None
+    #: OctoNet (2026-10-27): the waveform. "fmcw" = everything above (chirp slope, ADC samples, TDM loops);
+    #: "sfcw" = a stepped-frequency sweep of n_freq tones from f_start_hz to f_stop_hz, one complex sample per
+    #: tone and Tx-Rx pair, no slow time (one sweep per frame): ``samples`` then counts the tones, ``loops`` is 1,
+    #: and the range axis is the IFFT over the tones (bin c / 2B). The FMCW-only members are 0 and unused.
+    modulation: str = "fmcw"
+    f_start_hz: float = 0.0
+    f_stop_hz: float = 0.0
+    n_freq: int = 0
 
     @property
     def chirps(self) -> int:
@@ -477,8 +486,23 @@ class Radar:
         return C_LIGHT_M_S / self.carrier_hz
 
     @property
+    def bandwidth_hz(self) -> float:
+        if self.modulation == "sfcw":
+            return self.f_stop_hz - self.f_start_hz
+        return self.slope_hz_s * self.samples / self.sample_rate_hz
+
+    @property
     def range_bin_m(self) -> float:
+        if self.modulation == "sfcw":
+            return C_LIGHT_M_S / (2.0 * self.bandwidth_hz)                 # c / 2B: 3.75 cm for the Vayyar
         return C_LIGHT_M_S * self.sample_rate_hz / (2.0 * self.slope_hz_s * self.samples)
+
+    @property
+    def unambiguous_range_m(self) -> float:
+        """SFCW: c / (2 df); FMCW: the full range axis."""
+        if self.modulation == "sfcw":
+            return C_LIGHT_M_S / (2.0 * self.bandwidth_hz / (self.n_freq - 1))
+        return self.range_bin_m * self.samples
 
     @property
     def loop_period_s(self) -> float:
@@ -617,6 +641,8 @@ class Dataset:
         """Where this dataset is on this machine: ``$<root_env>``, else the install's."""
         if self.name == "hupr":
             return Install.from_env().dataset_root
+        if self.name == "octonet":
+            return _env_path(self.root_env, DEFAULT_OCTONET_ROOT)
         return _env_path(self.root_env, DEFAULT_RTPOSE_ROOT)
 
     def sequence_dir(self, sequence: int) -> Path:
@@ -820,7 +846,28 @@ RTPOSE = Dataset(
         rx_el=(0,) * 16, design_hz=76.8e9, n_angle=128, training_n_angle=86),),
     scene_source="lidar", frame_count=None, root_env="RTPOSE_DATASET_ROOT")
 
-_DATASETS = {"hupr": HUPR, "rtpose": RTPOSE}
+#: OctoNet (NeurIPS 2025 D&B, Scene 1): the Vayyar IMAGEVK-74 SFCW radar on node_1 (63-67 GHz in 100 tones, 20 Tx x
+#: 20 Rx = 400 pairs, one sweep per frame at ~3.1 Hz, no slow time), with 3 RealSense D455 depth cameras (nodes 1/3/5)
+#: and 125 Hz OptiTrack MoCap as the scene/person sources. UWB (Novelda X4M200, node_1) and Wi-Fi CSI (4 receivers)
+#: are described in mm4DPS.octonet.SENSORS: they are not FMCW radars and get their own heads (octonet_heads).
+#: The Tx element layout is UNVERIFIED (the coupling shows two Tx sub-groups): tx_az/rx_az are placeholders and no
+#: azimuth beamforming is used; only pair-wise range profiles (mm4DPS.octonet). Decoder "octonet" = the NBS loaders
+#: (nbs/preprocessing/octonet_io) through mm4DPS.octonet.OctoNetSequence, not an ADC stream.
+OCTONET = Dataset(
+    name="octonet",
+    radars=(Radar(
+        name="vayyar", config="vayyar_imagevk74.json", member="vayyar",
+        n_tx=20, n_rx=20, tx_order=tuple(range(20)), azimuth_tx=tuple(range(20)),
+        loops=1, samples=100, sample_rate_hz=0.0, slope_hz_s=0.0, carrier_hz=65.0e9, chirp_duration_s=0.0,
+        frame_rate_hz=3.1, decoder="octonet", fov_zero_db_deg=60.0,
+        tx_az=tuple(range(20)), tx_el=(0,) * 20, rx_az=(0,) * 20, rx_el=tuple(range(20)),
+        design_hz=65.0e9, n_angle=64, training_n_angle=20,
+        modulation="sfcw", f_start_hz=63.0e9, f_stop_hz=67.0e9, n_freq=100),),
+    scene_source="rgbd", frame_count=None, root_env="OCTONET_DATASET_ROOT",
+    camera_hfov_deg=87.0,          # nominal D455 depth HFOV; OctoNet ships no intrinsics (and no RGB video)
+    image_keypoints=False, azimuth_registration="constant", camera_radar_yaw_deg=0.0, depth_scale_mode="sequence")
+
+_DATASETS = {"hupr": HUPR, "rtpose": RTPOSE, "octonet": OCTONET}
 
 
 def rotation_about_y(degrees: float) -> np.ndarray:
