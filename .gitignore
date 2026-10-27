@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 *.so
 .build_stamp.json
-build/
+/build/
 *.egg-info/
 .DS_Store
 
@@ -15,5 +15,5 @@ build/
 # experiment outputs / derived products
 nbs/output/
 nbs/logs/
-data/
-runs/
+/data/
+/runs/
