@@ -164,8 +164,26 @@ def camera_pose_assumed(node: int, target_xy=(0.0, 0.0)) -> tuple[np.ndarray, np
     R_wc = np.stack([right, down, fwd], axis=1)   # columns = camera axes expressed in world
     return R_wc, t
 
-def cam_to_world(p_cam: np.ndarray, node: int) -> np.ndarray:
+def calib_json_path() -> str:
+    return os.path.join(C.NBS_DATA_OUT, "calib_S1", "extrinsics.json")
+
+def camera_pose(node: int, prefer_calibrated: bool = True) -> tuple[np.ndarray, np.ndarray, str]:
+    """(R_wc, t_w, source) — the calibrated pose from octonet_calibrate if its file exists, else the
+    assumed look-at-origin pose. ``source`` is 'calibrated' or 'assumed' (put it in figure titles)."""
+    p = calib_json_path()
+    if prefer_calibrated and os.path.exists(p):
+        import json
+        c = json.load(open(p))["cameras"].get(f"node_{node}")
+        if c:
+            return np.array(c["R_wc"]), np.array(c["t_w"]), "calibrated"
     R, t = camera_pose_assumed(node)
+    return R, t, "assumed"
+
+def pose_source(node: int = 1) -> str:
+    return camera_pose(node)[2]
+
+def cam_to_world(p_cam: np.ndarray, node: int, prefer_calibrated: bool = True) -> np.ndarray:
+    R, t, _ = camera_pose(node, prefer_calibrated)
     return p_cam @ R.T + t
 
 # ---------------------------------------------------------------------------
