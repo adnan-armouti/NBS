@@ -154,7 +154,7 @@ def solve_node(node: int, rec: str):
                 person_obs=len(obs), range_cam_over_world=float(np.mean(rng_cam) / np.mean(rng_w)),
                 range_cam_m=float(np.mean(rng_cam)), range_world_m=float(np.mean(rng_w)),
                 person_elev_deg=float(np.mean(elev)), hip_z_m=float(np.mean([o["hip"][2] for o in obs])),
-                _bg=bg, _floor=Q, _obs=obs)
+                _bg=bg, _floor=Q, _obs=obs, _R_tilt=R_tilt)
 
 
 # --------------------------------------------------------------------------- cross-camera check
@@ -187,6 +187,112 @@ def icp_refine(src: np.ndarray, dst: np.ndarray, thresh=0.3):
           o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
     T = np.asarray(res.transformation); ang = float(np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1))))
     return T, ang, float(np.linalg.norm(T[:3, 3])), float(res.fitness), float(res.inlier_rmse)
+
+
+# --------------------------------------------------------------------------- v2: landmarks + offset/scale
+LM_HEIGHT = (0.3, 1.4)      # m above floor: a node box + sensors on a tripod
+LM_WIN = (60, 45)           # half-window (px) around the predicted pixel: ~5 deg of yaw/offset slack at 5 m
+
+
+def landmark_observations(node: int, bg: np.ndarray, K: S.Intrinsics, R_wc: np.ndarray, t_w: np.ndarray,
+                          R_tilt: np.ndarray, h_floor: float):
+    """The OTHER nodes as landmarks: project each known rigid-body position into this camera under the
+    current pose, then look for an object 0.3-1.4 m above the floor near the predicted pixel and range.
+    Returns one observation per detected landmark: camera-frame blob mean, measured vs predicted range."""
+    from scipy import ndimage
+    H, W = bg.shape; R_cw = R_wc.T; out = []
+    for m, pos in S.NODE_POS_S1.items():
+        if m == node: continue
+        pc = R_cw @ (pos - t_w)
+        if pc[2] < 0.5: continue
+        u0, v0 = K.fx * pc[0] / pc[2] + K.cx, K.fy * pc[1] / pc[2] + K.cy
+        r_pred = float(np.linalg.norm(pc))
+        if not (LM_WIN[0] < u0 < W - LM_WIN[0] and LM_WIN[1] < v0 < H - LM_WIN[1]):
+            out.append(dict(landmark=m, visible=False, uv_pred=[u0, v0], r_pred=r_pred)); continue
+        us, vs = slice(int(u0 - LM_WIN[0]), int(u0 + LM_WIN[0])), slice(int(v0 - LM_WIN[1]), int(v0 + LM_WIN[1]))
+        v, u = np.mgrid[vs, us]; D = bg[vs, us]
+        P = np.stack([(u - K.cx) / K.fx * D, (v - K.cy) / K.fy * D, D], -1); q = P @ R_tilt.T
+        height = h_floor - q[..., 1]; rng = np.linalg.norm(q, axis=-1)
+        msk = (D > 0.5) & (height > LM_HEIGHT[0]) & (height < LM_HEIGHT[1]) & (rng > 0.6 * r_pred) & (rng < 1.4 * r_pred)
+        msk = ndimage.binary_opening(msk, iterations=1); lab, n = ndimage.label(msk)
+        best = None
+        for k in range(1, n + 1):
+            b = lab == k
+            if b.sum() < 60: continue
+            rm = float(np.median(rng[b]))
+            score = b.sum() / (1 + 4 * abs(rm - r_pred) / r_pred)       # big and near the predicted range
+            if best is None or score > best[0]: best = (score, b, rm)
+        if best is None:
+            out.append(dict(landmark=m, visible=True, detected=False, uv_pred=[u0, v0], r_pred=r_pred)); continue
+        _, b, rm = best; vv, uu = np.nonzero(b)
+        out.append(dict(landmark=m, visible=True, detected=True, uv_pred=[u0, v0], r_pred=r_pred, r_meas=rm,
+                        uv_meas=[float(uu.mean() + us.start), float(vv.mean() + vs.start)], p_cam=P[b].mean(0).tolist(),
+                        area=int(b.sum()), target=pos.tolist()))
+    return out
+
+
+def fit_pose_v2(obs_person, obs_lm, R_tilt, t_marker, h_floor, mode: str):
+    """Horizontal least squares over (yaw, dx, dy[, scale]) with the person + landmark observations.
+    world = R_level(yaw) R_tilt (s * p_cam) + t_marker + (dx, dy, dz);  dz = s*h_floor - z_marker.
+    mode: 'offset' (s=1), 'scale' (dx=dy=0), 'both'."""
+    from scipy.optimize import least_squares
+    P = [np.array(o["p_cam"]) for o in obs_person] + [np.array(o["p_cam"]) for o in obs_lm]
+    T = [np.array(o["hip"]) for o in obs_person] + [np.array(o["target"]) for o in obs_lm]
+    wts = np.array([1.0 / max(len(obs_person), 1)] * len(obs_person) + [1.0] * len(obs_lm))  # person counts as one target
+    def unpack(x):
+        psi = x[0]; dx = dy = 0.0; s = 1.0
+        if mode in ("offset", "both"): dx, dy = x[1], x[2]
+        if mode == "scale": s = x[1]
+        if mode == "both": s = x[3]
+        return psi, dx, dy, s
+    def resid(x):
+        psi, dx, dy, s = unpack(x); R = level_rotation(psi) @ R_tilt
+        r = []
+        for p, t, w in zip(P, T, wts):
+            w_pred = R @ (s * p) + t_marker + np.array([dx, dy, 0.0]); r.append(np.sqrt(w) * (w_pred[:2] - t[:2]))
+        return np.concatenate(r)
+    x0 = {"offset": [0.0, 0.0, 0.0], "scale": [0.0, 1.0], "both": [0.0, 0.0, 0.0, 1.0]}[mode]
+    # initial yaw from the person alone
+    o = obs_person[0]; q = R_tilt @ np.array(o["p_cam"]); tgt = np.array(o["hip"]) - t_marker
+    x0[0] = float(np.arctan2(tgt[1], tgt[0]) - np.arctan2(-q[0], q[2]))
+    sol = least_squares(resid, x0)
+    psi, dx, dy, s = unpack(sol.x); R = level_rotation(psi) @ R_tilt
+    res = resid(sol.x).reshape(-1, 2); rms = float(np.sqrt((res ** 2).sum(1).mean()))
+    per = {}
+    for i, o in enumerate(obs_lm): per[f"node_{o['landmark']}"] = float(np.linalg.norm(res[len(obs_person) + i]) / np.sqrt(wts[len(obs_person) + i]))
+    per["person"] = float(np.mean([np.linalg.norm(res[i]) / np.sqrt(wts[i]) for i in range(len(obs_person))]))
+    dz = s * h_floor - t_marker[2]
+    return dict(mode=mode, yaw_deg=float(np.degrees(psi)), dx=float(dx), dy=float(dy), dz=float(dz), scale=float(s),
+                rms_m=rms, resid_m=per, n_landmarks=len(obs_lm), R_wc=R.tolist(), t_w=(t_marker + np.array([dx, dy, dz])).tolist())
+
+
+def figure_v2(sol, lm, fits, out_png):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    fig, axs = plt.subplots(1, 4, figsize=(24, 6.5), gridspec_kw=dict(width_ratios=[1, 1, 1, 1.1]))
+    for ax, n in zip(axs[:3], NODES):
+        s = sol[n]; ax.imshow(np.where(s["_bg"] > 0, s["_bg"], np.nan), cmap="viridis", vmin=0, vmax=8)
+        for o in lm[n]:
+            u, v = o["uv_pred"]
+            if not o["visible"]:
+                continue
+            ax.add_patch(plt.Rectangle((u - LM_WIN[0], v - LM_WIN[1]), 2 * LM_WIN[0], 2 * LM_WIN[1], fill=False, ec="w", lw=1, ls="--"))
+            ax.plot(u, v, "ws", mfc="none", ms=10, mew=1.5)
+            if o.get("detected"):
+                ax.plot(*o["uv_meas"], "o", color="orange", ms=7); ax.text(u + 5, v - 50, f"node_{o['landmark']}\npred {o['r_pred']:.2f} m\nmeas {o['r_meas']:.2f} m", color="w", fontsize=8)
+            else:
+                ax.text(u + 5, v - 50, f"node_{o['landmark']}\npred {o['r_pred']:.2f} m\nNOT found", color="r", fontsize=8)
+        ax.set_title(f"node_{n}: other nodes as landmarks (white = predicted under v1 pose, orange = detected)", fontsize=9)
+        ax.set_xlabel("u [px]"); ax.set_ylabel("v [px]")
+    ax = axs[3]; ax.axis("off"); lines = ["per-camera fits (horizontal residual rms, m)", ""]
+    for n in NODES:
+        lines.append(f"node_{n}: landmarks detected {sum(1 for o in lm[n] if o.get('detected'))}")
+        for mode in ("offset", "scale", "both"):
+            f = fits[n].get(mode)
+            if f: lines.append(f"  {mode:6s} yaw {f['yaw_deg']:7.1f} dx {f['dx']:+.2f} dy {f['dy']:+.2f} dz {f['dz']:+.2f} s {f['scale']:.3f} rms {f['rms_m']:.3f}")
+        lines.append(f"  chosen: {fits[n]['chosen']}  ({fits[n]['reason']})"); lines.append("")
+    ax.text(0, 1, "\n".join(lines), va="top", family="monospace", fontsize=8.5)
+    fig.suptitle("octonet_calibrate v2: camera offset from the marker vs depth scale, resolved with the other nodes as range landmarks", fontsize=12)
+    fig.tight_layout(); fig.savefig(out_png, dpi=150); plt.close(fig)
 
 
 # --------------------------------------------------------------------------- figure
@@ -246,10 +352,38 @@ def main():
         except Exception as e:
             print("ICP skipped:", e)
     figure(sol, clouds_as, clouds_cal, ov_as, ov_cal, os.path.join(viz_dir, "calibration.png"))
+    # ---- v2: landmarks -> offset vs scale
+    lm, fits = {}, {}
+    for n in NODES:
+        s = sol[n]; R1, t1 = np.array(s["R_wc"]), np.array(s["t_w"])
+        lm[n] = landmark_observations(n, s["_bg"], K, R1, t1, s["_R_tilt"], s["floor_height_m"])
+        det = [o for o in lm[n] if o.get("detected")]
+        for o in lm[n]:
+            print(f"  node_{n} landmark node_{o['landmark']}: " + ("not in view" if not o["visible"] else (f"pred {o['r_pred']:.2f} m -> meas {o['r_meas']:.2f} m (ratio {o['r_meas']/o['r_pred']:.3f}), {o['area']} px" if o.get("detected") else f"pred {o['r_pred']:.2f} m, NOT detected")))
+        fits[n] = {}
+        modes = ("offset", "scale", "both") if len(det) >= 1 else ("offset",)
+        for mode in modes:
+            try: fits[n][mode] = fit_pose_v2(s["_obs"], det, s["_R_tilt"], S.NODE_POS_S1[n], s["floor_height_m"], mode)
+            except Exception as e: print("   fit", mode, "failed:", e)
+        # choose: with no landmark only the along-boresight offset is identifiable -> 'offset' (it reduces to that); with
+        # landmarks prefer 'offset' unless 'scale' beats it clearly (> 25 % lower rms), 'both' only if it beats both by 25 %.
+        fo, fs, fb = fits[n].get("offset"), fits[n].get("scale"), fits[n].get("both")
+        chosen, reason = "offset", "no landmark: only the along-boresight offset is identifiable" if not det else "offset explains the landmarks"
+        if det and fs and fs["rms_m"] < 0.75 * fo["rms_m"]: chosen, reason = "scale", "depth scale fits the landmarks clearly better than an offset"
+        if det and fb and fb["rms_m"] < 0.75 * min(fo["rms_m"], fs["rms_m"] if fs else 9): chosen, reason = "both", "offset+scale clearly better than either alone"
+        fits[n]["chosen"], fits[n]["reason"] = chosen, reason
+        f = fits[n][chosen]; print(f"node_{n} v2 [{chosen}]: yaw {f['yaw_deg']:.1f} (v1 {s['yaw_deg']:.1f}) offset ({f['dx']:+.2f},{f['dy']:+.2f},{f['dz']:+.2f}) m scale {f['scale']:.3f} rms {f['rms_m']:.3f} m; {reason}")
+    figure_v2(sol, lm, fits, os.path.join(viz_dir, "calibration_v2.png"))
+    clouds_v2 = {n: cloud_world(sol[n]["_bg"] * fits[n][fits[n]["chosen"]]["scale"], np.array(fits[n][fits[n]["chosen"]]["R_wc"]), np.array(fits[n][fits[n]["chosen"]]["t_w"]), K) for n in NODES}
+    ov_v2 = overlap_metric(clouds_v2); print("overlap v2:", {k: round(v["median_nn_m"], 3) for k, v in ov_v2.items()})
     ext = {"frame": "MoCap world, metres, Z up, origin = subject spot", "method": __doc__.split("\n")[0],
            "recording": S.REC_WALK, "intrinsics": "nominal D455 87x58 deg, 640x480", "depth_decode": "8-bit * 10 m / 255",
-           "cameras": {f"node_{n}": {k: v for k, v in sol[n].items() if not k.startswith("_")} for n in NODES},
-           "vayyar": {"node": 1, "R_wc": sol[1]["R_wc"], "t_w": sol[1]["t_w"], "ASSUMPTION": "radar shares node_1's camera rotation and marker position"},
+           "cameras": {f"node_{n}": dict(fits[n][fits[n]["chosen"]], depth_scale=fits[n][fits[n]["chosen"]]["scale"], v2_mode=fits[n]["chosen"], v2_reason=fits[n]["reason"],
+                                        landmarks=[{k: v for k, v in o.items()} for o in lm[n]], pitch_deg=sol[n]["pitch_deg"], roll_deg=sol[n]["roll_deg"],
+                                        floor_height_m=sol[n]["floor_height_m"], node_marker_pos=S.NODE_POS_S1[n].tolist(), all_fits={m: {k: v for k, v in f.items() if k not in ("R_wc", "t_w")} for m, f in fits[n].items() if isinstance(f, dict)}) for n in NODES},
+           "cameras_v1_look_at_person": {f"node_{n}": {k: v for k, v in sol[n].items() if not k.startswith("_")} for n in NODES},
+           "overlap_v2": ov_v2,
+           "vayyar": {"node": 1, "R_wc": fits[1][fits[1]["chosen"]]["R_wc"], "t_w": S.NODE_POS_S1[1].tolist(), "ASSUMPTION": "radar shares node_1's camera rotation; placed at the marker position"},
            "overlap_assumed": ov_as, "overlap_calibrated": ov_cal, "icp_to_node1_not_applied": icp}
     with open(os.path.join(out_dir, "extrinsics.json"), "w") as f: json.dump(ext, f, indent=1)
     print("wrote", os.path.join(out_dir, "extrinsics.json"))
