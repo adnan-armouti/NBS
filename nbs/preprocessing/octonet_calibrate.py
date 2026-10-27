@@ -347,15 +347,14 @@ def shared_wall_scales(clouds: dict) -> dict:
 
 
 def finalize_pose(sol: dict) -> dict:
-    """Apply the identifiable offsets: along-boresight from the person range ratio, vertical from the floor."""
+    """Apply the identifiable offsets. The person range mismatch is absorbed by the per-camera depth scale
+    (walls confirm a scale for node_5), so no along-boresight offset; vertical offset from the floor."""
     R = np.array(sol["R_wc"]); t = np.array(sol["t_w"])
-    fwd = R[:, 2].copy(); fwd[2] = 0; fwd /= np.linalg.norm(fwd)
-    d_along = 0.0                                                       # absorbed by the per-camera depth scale
-    resid_along = sol["range_world_surface_m"] - sol["range_cam_m"]     # residual after the scale, m (should be ~0)
+    resid_along = sol["range_world_surface_m"] - sol["range_cam_m"]     # residual after the scale, m (~0 by construction)
     d_z = sol["floor_height_m"] - t[2]                                  # +: camera above the marker
-    t2 = t + d_along * fwd + np.array([0, 0, d_z])
-    sol = dict(sol); sol.update(t_w=t2.tolist(), offset_along_m=float(d_along), offset_z_m=float(d_z), node_marker_pos=t.tolist(),
-                    note="position = marker + along-boresight offset (person range) + vertical offset (floor); lateral offset unobservable, set 0")
+    t2 = t + np.array([0, 0, d_z])
+    sol = dict(sol); sol.update(t_w=t2.tolist(), offset_along_m=0.0, resid_along_m=float(resid_along), offset_z_m=float(d_z), node_marker_pos=t.tolist(),
+                    note="position = marker + vertical offset (floor); person range mismatch -> per-camera depth scale; horizontal camera-marker offset unobservable, set 0")
     return sol
 
 
