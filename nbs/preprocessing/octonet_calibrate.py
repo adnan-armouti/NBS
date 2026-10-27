@@ -38,11 +38,12 @@ def _epoch_of_depth_png(p: str) -> float:
     return datetime.fromisoformat(s).timestamp()
 
 
-def median_background(node: int, rec: str):
+def median_background(node: int, rec: str, depth_scale: float = 1.0):
+    """depth_scale: measured depth = depth_scale * true depth (from the shared-wall check); divided out here."""
     clip = S.depth_clip_dir(node, rec)
     frames = S.depth_frames(clip)
     sel = [frames[i] for i in np.linspace(0, len(frames) - 1, N_BG).astype(int)]
-    st = np.stack([S.load_depth_m(p) for p in sel]); st[st <= 0] = np.nan
+    st = np.stack([S.load_depth_m(p) / depth_scale for p in sel]); st[st <= 0] = np.nan
     bg = np.nanmedian(st, 0); bg[np.isfinite(st).mean(0) < 0.5] = 0; bg = np.nan_to_num(bg)
     return bg, frames
 
@@ -91,7 +92,7 @@ def level_rotation(psi: float) -> np.ndarray:
 
 
 def person_observations(node: int, rec: str, bg: np.ndarray, frames: list[str], K: S.Intrinsics,
-                        R_tilt: np.ndarray, h_floor: float, t_w: np.ndarray):
+                        R_tilt: np.ndarray, h_floor: float, t_w: np.ndarray, depth_scale: float = 1.0):
     """Person = the largest blob of pixels at the MoCap-predicted camera range (+-0.6 m), standing
     0.2..2.0 m above the fitted floor. (The subject walks IN PLACE, so they are part of the temporal
     median and a motion-based foreground is empty.) Returns the blob's mean 3-D point per frame."""
@@ -104,7 +105,7 @@ def person_observations(node: int, rec: str, bg: np.ndarray, frames: list[str], 
     for p in [frames[i] for i in np.linspace(len(frames) * 0.1, len(frames) * 0.9, K_PERSON).astype(int)]:
         te = _epoch_of_depth_png(p); j = int(np.argmin(np.abs(tm - te))); dts.append(abs(tm[j] - te))
         if abs(tm[j] - te) > 0.25: continue
-        D = S.load_depth_m(p)[::2, ::2]
+        D = S.load_depth_m(p)[::2, ::2] / depth_scale
         r_exp = float(np.linalg.norm(hip[j] - t_w))
         P = np.stack([(u - K.cx) / K.fx * D, (v - K.cy) / K.fy * D, D], -1)        # (h,w,3) camera frame
         q = P @ R_tilt.T                                                           # levelled
@@ -125,12 +126,12 @@ def person_observations(node: int, rec: str, bg: np.ndarray, frames: list[str], 
     return obs
 
 
-def solve_node(node: int, rec: str):
+def solve_node(node: int, rec: str, depth_scale: float = 1.0):
     K = S.d455_nominal_intrinsics(); t_w = S.NODE_POS_S1[node].copy()
-    bg, frames = median_background(node, rec)
+    bg, frames = median_background(node, rec, depth_scale)
     n_c, d, Q, inl_frac, n_cand = ransac_floor(bg, K)
     R_tilt = tilt_rotation(n_c); h_floor = abs(d)
-    obs = person_observations(node, rec, bg, frames, K, R_tilt, h_floor, t_w)
+    obs = person_observations(node, rec, bg, frames, K, R_tilt, h_floor, t_w, depth_scale)
     if len(obs) < 3: raise RuntimeError(f"node_{node}: only {len(obs)} person observations")
     psis, rng_cam, rng_w, elev = [], [], [], []
     for o in obs:
@@ -148,7 +149,7 @@ def solve_node(node: int, rec: str):
     right_c = R_wc @ np.array([1.0, 0, 0]); roll = float(np.degrees(np.arcsin(right_c[2])))
     # assumed pose for comparison
     R_as, _ = S.camera_pose_assumed(node); psi_as = float(np.arctan2((R_as @ [0, 0, 1])[1], (R_as @ [0, 0, 1])[0]))
-    return dict(node=node, rec=rec, R_wc=R_wc.tolist(), t_w=t_w.tolist(), yaw_deg=float(np.degrees(psi)),
+    return dict(node=node, rec=rec, depth_scale=depth_scale, R_wc=R_wc.tolist(), t_w=t_w.tolist(), yaw_deg=float(np.degrees(psi)),
                 yaw_assumed_deg=float(np.degrees(psi_as)), yaw_std_deg=psi_std, pitch_deg=pitch, roll_deg=roll,
                 floor_height_m=h_floor, node_marker_z_m=float(t_w[2]), floor_inlier_frac=inl_frac, floor_candidates=n_cand,
                 person_obs=len(obs), range_cam_over_world=float(np.mean(rng_cam) / np.mean(rng_w)),
@@ -295,6 +296,65 @@ def figure_v2(sol, lm, fits, out_png):
     fig.tight_layout(); fig.savefig(out_png, dpi=150); plt.close(fig)
 
 
+# --------------------------------------------------------------------------- v3: shared walls -> depth scale; person -> along-boresight offset
+WALL_BIN = 0.05
+
+def wall_position(cloud: np.ndarray, axis: int, sign: int, other_lim: tuple, search: tuple):
+    """Dominant plane-like peak of the point histogram along ``axis`` (0=X,1=Y) within ``search`` (m),
+    using points at wall height (0.3<Z<2.0) and inside ``other_lim`` on the other horizontal axis.
+    Returns (position, peak_count, histogram) or (None, 0, None)."""
+    o = 1 - axis
+    m = (cloud[:, 2] > 0.3) & (cloud[:, 2] < 2.0) & (cloud[:, o] > other_lim[0]) & (cloud[:, o] < other_lim[1])
+    x = cloud[m, axis]; lo, hi = sorted(search)
+    edges = np.arange(lo, hi + WALL_BIN, WALL_BIN); h, _ = np.histogram(x, edges)
+    if h.max() < 30: return None, int(h.max()), (edges, h)
+    # a wall = the outermost bin whose count is >= 50 % of the max (robust to clutter in front of it)
+    strong = np.nonzero(h >= 0.5 * h.max())[0]
+    k = strong[0] if sign < 0 else strong[-1]
+    # refine: centroid of the 3 bins around k
+    kk = slice(max(k - 1, 0), min(k + 2, len(h))); c = (edges[kk] + WALL_BIN / 2); w = h[kk]
+    return float((c * w).sum() / w.sum()), int(h[k]), (edges, h)
+
+
+def shared_wall_scales(clouds: dict) -> dict:
+    """Relative depth scales from walls seen by two cameras, node_1 = reference (scale 1).
+    -X wall: node_1 (frontal) vs node_3;  -Y wall: node_3 vs node_5."""
+    t = S.NODE_POS_S1; out = dict(scale={1: 1.0}, walls={}, notes=[])
+    xw1, c1, _ = wall_position(clouds[1], 0, -1, (-1.0, 1.5), (-6.0, -2.0))
+    xw3, c3, _ = wall_position(clouds[3], 0, -1, (-1.0, 1.5), (-6.0, -2.0))
+    out["walls"]["-X"] = {"node_1": xw1, "node_3": xw3, "counts": [c1, c3]}
+    if xw1 is not None and xw3 is not None:
+        out["scale"][3] = (xw3 - t[3][0]) / (xw1 - t[3][0])
+        out["notes"].append(f"-X wall: node_1 {xw1:.2f} m, node_3 {xw3:.2f} m -> node_3 scale {out['scale'][3]:.3f}")
+    else:
+        out["scale"][3] = 1.0; out["notes"].append("-X wall not found in both -> node_3 scale 1")
+    x3_true = t[3][0] + (xw3 - t[3][0]) / out["scale"][3] if xw3 is not None else None
+    yw3, c3, _ = wall_position(clouds[3], 1, -1, (-1.5, 1.5), (-7.0, -2.0))
+    yw5, c5, _ = wall_position(clouds[5], 1, -1, (-1.5, 1.5), (-7.0, -2.0))
+    out["walls"]["-Y"] = {"node_3": yw3, "node_5": yw5, "counts": [c3, c5]}
+    if yw3 is not None and yw5 is not None:
+        y_true = t[3][1] + (yw3 - t[3][1]) / out["scale"][3]            # node_3's wall corrected by its own scale
+        out["scale"][5] = (yw5 - t[5][1]) / (y_true - t[5][1])
+        out["notes"].append(f"-Y wall: node_3 {yw3:.2f} m (-> {y_true:.2f} true), node_5 {yw5:.2f} m -> node_5 scale {out['scale'][5]:.3f}")
+    else:
+        out["scale"][5] = 1.0; out["notes"].append("-Y wall not found in both -> node_5 scale 1")
+    xw5, c5, _ = wall_position(clouds[5], 0, +1, (-1.5, 2.0), (2.5, 6.5))
+    out["walls"]["+X"] = {"node_5": xw5, "counts": [c5], "note": "seen by node_5 only (no cross-check)"}
+    return out
+
+
+def finalize_pose(sol: dict) -> dict:
+    """Apply the identifiable offsets: along-boresight from the person range ratio, vertical from the floor."""
+    R = np.array(sol["R_wc"]); t = np.array(sol["t_w"])
+    fwd = R[:, 2].copy(); fwd[2] = 0; fwd /= np.linalg.norm(fwd)
+    d_along = sol["range_world_m"] - sol["range_cam_m"]                   # +: camera in front of the marker
+    d_z = sol["floor_height_m"] - t[2]                                  # +: camera above the marker
+    t2 = t + d_along * fwd + np.array([0, 0, d_z])
+    sol = dict(sol); sol.update(t_w=t2.tolist(), offset_along_m=float(d_along), offset_z_m=float(d_z), node_marker_pos=t.tolist(),
+                    note="position = marker + along-boresight offset (person range) + vertical offset (floor); lateral offset unobservable, set 0")
+    return sol
+
+
 # --------------------------------------------------------------------------- figure
 def figure(sol: dict, clouds_as: dict, clouds_cal: dict, ov_as, ov_cal, out_png: str):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -352,39 +412,36 @@ def main():
         except Exception as e:
             print("ICP skipped:", e)
     figure(sol, clouds_as, clouds_cal, ov_as, ov_cal, os.path.join(viz_dir, "calibration.png"))
-    # ---- v2: landmarks -> offset vs scale
+    # ---- v2 (diagnostic only): the other nodes as landmarks. Rejected on this data: the detections are the
+    #      background behind the predicted pixels (nodes are not distinct in 8-bit depth at 4-5 m).
     lm, fits = {}, {}
     for n in NODES:
-        s = sol[n]; R1, t1 = np.array(s["R_wc"]), np.array(s["t_w"])
-        lm[n] = landmark_observations(n, s["_bg"], K, R1, t1, s["_R_tilt"], s["floor_height_m"])
-        det = [o for o in lm[n] if o.get("detected")]
-        for o in lm[n]:
-            print(f"  node_{n} landmark node_{o['landmark']}: " + ("not in view" if not o["visible"] else (f"pred {o['r_pred']:.2f} m -> meas {o['r_meas']:.2f} m (ratio {o['r_meas']/o['r_pred']:.3f}), {o['area']} px" if o.get("detected") else f"pred {o['r_pred']:.2f} m, NOT detected")))
-        fits[n] = {}
-        modes = ("offset", "scale", "both") if len(det) >= 1 else ("offset",)
-        for mode in modes:
+        s = sol[n]; lm[n] = landmark_observations(n, s["_bg"], K, np.array(s["R_wc"]), np.array(s["t_w"]), s["_R_tilt"], s["floor_height_m"])
+        det = [o for o in lm[n] if o.get("detected")]; fits[n] = {}
+        for mode in (("offset", "scale", "both") if det else ("offset",)):
             try: fits[n][mode] = fit_pose_v2(s["_obs"], det, s["_R_tilt"], S.NODE_POS_S1[n], s["floor_height_m"], mode)
             except Exception as e: print("   fit", mode, "failed:", e)
-        # choose: with no landmark only the along-boresight offset is identifiable -> 'offset' (it reduces to that); with
-        # landmarks prefer 'offset' unless 'scale' beats it clearly (> 25 % lower rms), 'both' only if it beats both by 25 %.
-        fo, fs, fb = fits[n].get("offset"), fits[n].get("scale"), fits[n].get("both")
-        chosen, reason = "offset", "no landmark: only the along-boresight offset is identifiable" if not det else "offset explains the landmarks"
-        if det and fs and fs["rms_m"] < 0.75 * fo["rms_m"]: chosen, reason = "scale", "depth scale fits the landmarks clearly better than an offset"
-        if det and fb and fb["rms_m"] < 0.75 * min(fo["rms_m"], fs["rms_m"] if fs else 9): chosen, reason = "both", "offset+scale clearly better than either alone"
-        fits[n]["chosen"], fits[n]["reason"] = chosen, reason
-        f = fits[n][chosen]; print(f"node_{n} v2 [{chosen}]: yaw {f['yaw_deg']:.1f} (v1 {s['yaw_deg']:.1f}) offset ({f['dx']:+.2f},{f['dy']:+.2f},{f['dz']:+.2f}) m scale {f['scale']:.3f} rms {f['rms_m']:.3f} m; {reason}")
+        fits[n]["chosen"], fits[n]["reason"] = "none", "landmark detections are background clutter (see calibration_v2.png); not used"
     figure_v2(sol, lm, fits, os.path.join(viz_dir, "calibration_v2.png"))
-    clouds_v2 = {n: cloud_world(sol[n]["_bg"] * fits[n][fits[n]["chosen"]]["scale"], np.array(fits[n][fits[n]["chosen"]]["R_wc"]), np.array(fits[n][fits[n]["chosen"]]["t_w"]), K) for n in NODES}
-    ov_v2 = overlap_metric(clouds_v2); print("overlap v2:", {k: round(v["median_nn_m"], 3) for k, v in ov_v2.items()})
+    # ---- v3: depth scale from shared walls (node_1 reference), then re-solve with the scale divided out
+    ws = shared_wall_scales(clouds_cal)
+    for line in ws["notes"]: print("  " + line)
+    sol3 = {n: finalize_pose(solve_node(n, S.REC_WALK, depth_scale=ws["scale"][n])) for n in NODES}
+    for n in NODES:
+        s = sol3[n]; print(f"node_{n} v3: scale {s['depth_scale']:.3f} yaw {s['yaw_deg']:.1f} pitch {s['pitch_deg']:+.1f} roll {s['roll_deg']:+.1f} | floor h {s['floor_height_m']:.2f} vs z {s['node_marker_z_m']:.2f} | range ratio {s['range_cam_over_world']:.3f} -> offsets along {s['offset_along_m']:+.2f} m, z {s['offset_z_m']:+.2f} m")
+    clouds_v3 = {n: cloud_world(sol3[n]["_bg"], np.array(sol3[n]["R_wc"]), np.array(sol3[n]["t_w"]), K) for n in NODES}
+    ov_v3 = overlap_metric(clouds_v3); print("overlap v3:", {k: round(v["median_nn_m"], 3) for k, v in ov_v3.items()})
+    ws3 = shared_wall_scales(clouds_v3); print("  walls after v3:", {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in ws3["walls"].items()})
+    figure(sol3, clouds_as, clouds_v3, ov_as, ov_v3, os.path.join(viz_dir, "calibration.png"))
     ext = {"frame": "MoCap world, metres, Z up, origin = subject spot", "method": __doc__.split("\n")[0],
            "recording": S.REC_WALK, "intrinsics": "nominal D455 87x58 deg, 640x480", "depth_decode": "8-bit * 10 m / 255",
-           "cameras": {f"node_{n}": dict(fits[n][fits[n]["chosen"]], depth_scale=fits[n][fits[n]["chosen"]]["scale"], v2_mode=fits[n]["chosen"], v2_reason=fits[n]["reason"],
-                                        landmarks=[{k: v for k, v in o.items()} for o in lm[n]], pitch_deg=sol[n]["pitch_deg"], roll_deg=sol[n]["roll_deg"],
-                                        floor_height_m=sol[n]["floor_height_m"], node_marker_pos=S.NODE_POS_S1[n].tolist(), all_fits={m: {k: v for k, v in f.items() if k not in ("R_wc", "t_w")} for m, f in fits[n].items() if isinstance(f, dict)}) for n in NODES},
+           "cameras": {f"node_{n}": {k: v for k, v in sol3[n].items() if not k.startswith("_")} for n in NODES},
+           "shared_walls": {"scale": {str(k): v for k, v in ws["scale"].items()}, "walls_v1": ws["walls"], "walls_v3": ws3["walls"], "notes": ws["notes"]},
+           "landmark_experiment_rejected": {f"node_{n}": {"landmarks": lm[n], "fits": {m: {k: v for k, v in f.items() if k not in ("R_wc", "t_w")} for m, f in fits[n].items() if isinstance(f, dict)}, "reason": fits[n]["reason"]} for n in NODES},
            "cameras_v1_look_at_person": {f"node_{n}": {k: v for k, v in sol[n].items() if not k.startswith("_")} for n in NODES},
-           "overlap_v2": ov_v2,
-           "vayyar": {"node": 1, "R_wc": fits[1][fits[1]["chosen"]]["R_wc"], "t_w": S.NODE_POS_S1[1].tolist(), "ASSUMPTION": "radar shares node_1's camera rotation; placed at the marker position"},
-           "overlap_assumed": ov_as, "overlap_calibrated": ov_cal, "icp_to_node1_not_applied": icp}
+           "overlap_v3": ov_v3,
+           "vayyar": {"node": 1, "R_wc": sol3[1]["R_wc"], "t_w": S.NODE_POS_S1[1].tolist(), "ASSUMPTION": "radar shares node_1's camera rotation; placed at the marker position (mount yaw to be measured)"},
+           "overlap_assumed": ov_as, "overlap_v1": ov_cal, "icp_to_node1_not_applied": icp}
     with open(os.path.join(out_dir, "extrinsics.json"), "w") as f: json.dump(ext, f, indent=1)
     print("wrote", os.path.join(out_dir, "extrinsics.json"))
 

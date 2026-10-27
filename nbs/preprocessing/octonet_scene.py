@@ -167,6 +167,19 @@ def camera_pose_assumed(node: int, target_xy=(0.0, 0.0)) -> tuple[np.ndarray, np
 def calib_json_path() -> str:
     return os.path.join(C.NBS_DATA_OUT, "calib_S1", "extrinsics.json")
 
+def depth_scale(node: int) -> float:
+    """Per-camera depth scale from octonet_calibrate (measured = scale * true); 1.0 without calibration."""
+    p = calib_json_path()
+    if os.path.exists(p):
+        import json
+        c = json.load(open(p))["cameras"].get(f"node_{node}")
+        if c: return float(c.get("depth_scale", 1.0))
+    return 1.0
+
+def load_depth_m_calibrated(png_path: str, node: int) -> np.ndarray:
+    """load_depth_m with the camera's calibrated depth scale divided out."""
+    return load_depth_m(png_path) / depth_scale(node)
+
 def camera_pose(node: int, prefer_calibrated: bool = True) -> tuple[np.ndarray, np.ndarray, str]:
     """(R_wc, t_w, source) — the calibrated pose from octonet_calibrate if its file exists, else the
     assumed look-at-origin pose. ``source`` is 'calibrated' or 'assumed' (put it in figure titles)."""
