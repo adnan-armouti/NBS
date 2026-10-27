@@ -108,11 +108,29 @@ def d455_nominal_intrinsics() -> Intrinsics:
     fy = (H / 2) / np.tan(np.deg2rad(D455_VFOV_DEG / 2))
     return Intrinsics(fx, fy, W / 2, H / 2)
 
+def index_row(rec: str):
+    """The cut_manual.csv row of a recording. ``rec`` = the 14-digit stamp of node_1's files
+    (other nodes' files carry their own stamp, +-1 s), matched against the node_1 paths."""
+    from preprocessing import octonet_io as IO
+    df = IO.load_index()
+    m = df["node_1_depthCamera_data_path"].astype(str).str.contains(rec) | \
+        df["node_1_uwb_data_path"].astype(str).str.contains(rec)
+    if not m.any():
+        raise KeyError(f"recording {rec} not in cut_manual.csv")
+    return df[m].iloc[0]
+
+def modality_path(node: int, modality: str, rec: str) -> str:
+    """Absolute path of node_<n>'s <modality> data for a recording (via cut_manual.csv)."""
+    from preprocessing import octonet_io as IO
+    row = index_row(rec)
+    rel = row[f"node_{node}_{modality}_data_path"]
+    if not isinstance(rel, str) or not rel:
+        raise FileNotFoundError(f"node_{node} has no {modality} for {rec}")
+    return IO.resolve(rel)
+
 def depth_clip_dir(node: int, rec: str) -> str:
-    hits = glob.glob(os.path.join(C.OCTONET_ROOT, f"node_{node}", "depthCamera", "data", f"{rec}*"))
-    if not hits:
-        raise FileNotFoundError(f"no depth clip for node_{node} rec {rec}")
-    return hits[0]
+    p = modality_path(node, "depthCamera", rec)
+    return p if os.path.isdir(p) else os.path.dirname(p)
 
 def depth_frames(clip_dir: str) -> list[str]:
     return sorted(glob.glob(os.path.join(clip_dir, "depth_*.png")))
