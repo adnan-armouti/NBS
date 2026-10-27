@@ -31,6 +31,7 @@ N_BG = 30           # frames for the median background
 K_PERSON = 16       # frames for the yaw solve
 FLOOR_TOL = 0.06    # m, inlier tolerance (depth quantisation 3.9 cm)
 FG_THRESH = 0.35    # m closer than background = foreground
+TORSO_R = 0.12      # m: the person blob is the camera-facing body surface; the MoCap hip is ~0.12 m behind it
 
 
 def _epoch_of_depth_png(p: str) -> float:
@@ -149,7 +150,9 @@ def solve_node(node: int, rec: str, depth_scale: float = 1.0):
     right_c = R_wc @ np.array([1.0, 0, 0]); roll = float(np.degrees(np.arcsin(right_c[2])))
     # assumed pose for comparison
     R_as, _ = S.camera_pose_assumed(node); psi_as = float(np.arctan2((R_as @ [0, 0, 1])[1], (R_as @ [0, 0, 1])[0]))
-    return dict(node=node, rec=rec, depth_scale=depth_scale, R_wc=R_wc.tolist(), t_w=t_w.tolist(), yaw_deg=float(np.degrees(psi)),
+    r_surface = float(np.mean(rng_w)) - TORSO_R
+    return dict(node=node, rec=rec, depth_scale=depth_scale, scale_person=float(np.mean(rng_cam) / r_surface),
+                range_world_surface_m=r_surface, R_wc=R_wc.tolist(), t_w=t_w.tolist(), yaw_deg=float(np.degrees(psi)),
                 yaw_assumed_deg=float(np.degrees(psi_as)), yaw_std_deg=psi_std, pitch_deg=pitch, roll_deg=roll,
                 floor_height_m=h_floor, node_marker_z_m=float(t_w[2]), floor_inlier_frac=inl_frac, floor_candidates=n_cand,
                 person_obs=len(obs), range_cam_over_world=float(np.mean(rng_cam) / np.mean(rng_w)),
@@ -347,7 +350,8 @@ def finalize_pose(sol: dict) -> dict:
     """Apply the identifiable offsets: along-boresight from the person range ratio, vertical from the floor."""
     R = np.array(sol["R_wc"]); t = np.array(sol["t_w"])
     fwd = R[:, 2].copy(); fwd[2] = 0; fwd /= np.linalg.norm(fwd)
-    d_along = sol["range_world_m"] - sol["range_cam_m"]                   # +: camera in front of the marker
+    d_along = 0.0                                                       # absorbed by the per-camera depth scale
+    resid_along = sol["range_world_surface_m"] - sol["range_cam_m"]     # residual after the scale, m (should be ~0)
     d_z = sol["floor_height_m"] - t[2]                                  # +: camera above the marker
     t2 = t + d_along * fwd + np.array([0, 0, d_z])
     sol = dict(sol); sol.update(t_w=t2.tolist(), offset_along_m=float(d_along), offset_z_m=float(d_z), node_marker_pos=t.tolist(),
@@ -426,9 +430,12 @@ def main():
     # ---- v3: depth scale from shared walls (node_1 reference), then re-solve with the scale divided out
     ws = shared_wall_scales(clouds_cal)
     for line in ws["notes"]: print("  " + line)
-    sol3 = {n: finalize_pose(solve_node(n, S.REC_WALK, depth_scale=ws["scale"][n])) for n in NODES}
+    sp = {n: sol[n]["scale_person"] for n in NODES}
+    print("  person-based absolute scales (blob = body surface, hip - %.2f m):" % TORSO_R, {n: round(v, 3) for n, v in sp.items()},
+          "| wall-based relative: node_3/node_1 %.3f (person %.3f), node_5/node_3 %.3f (person %.3f)" % (ws["scale"][3], sp[3] / sp[1], ws["scale"][5], sp[5] / sp[3]))
+    sol3 = {n: finalize_pose(solve_node(n, S.REC_WALK, depth_scale=sp[n])) for n in NODES}
     for n in NODES:
-        s = sol3[n]; print(f"node_{n} v3: scale {s['depth_scale']:.3f} yaw {s['yaw_deg']:.1f} pitch {s['pitch_deg']:+.1f} roll {s['roll_deg']:+.1f} | floor h {s['floor_height_m']:.2f} vs z {s['node_marker_z_m']:.2f} | range ratio {s['range_cam_over_world']:.3f} -> offsets along {s['offset_along_m']:+.2f} m, z {s['offset_z_m']:+.2f} m")
+        s = sol3[n]; print(f"node_{n} v3: scale {s['depth_scale']:.3f} yaw {s['yaw_deg']:.1f} pitch {s['pitch_deg']:+.1f} roll {s['roll_deg']:+.1f} | floor h {s['floor_height_m']:.2f} vs z {s['node_marker_z_m']:.2f} -> z offset {s['offset_z_m']:+.2f} m | person range residual {s['resid_along_m']:+.3f} m")
     clouds_v3 = {n: cloud_world(sol3[n]["_bg"], np.array(sol3[n]["R_wc"]), np.array(sol3[n]["t_w"]), K) for n in NODES}
     ov_v3 = overlap_metric(clouds_v3); print("overlap v3:", {k: round(v["median_nn_m"], 3) for k, v in ov_v3.items()})
     ws3 = shared_wall_scales(clouds_v3); print("  walls after v3:", {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in ws3["walls"].items()})
@@ -436,7 +443,8 @@ def main():
     ext = {"frame": "MoCap world, metres, Z up, origin = subject spot", "method": __doc__.split("\n")[0],
            "recording": S.REC_WALK, "intrinsics": "nominal D455 87x58 deg, 640x480", "depth_decode": "8-bit * 10 m / 255",
            "cameras": {f"node_{n}": {k: v for k, v in sol3[n].items() if not k.startswith("_")} for n in NODES},
-           "shared_walls": {"scale": {str(k): v for k, v in ws["scale"].items()}, "walls_v1": ws["walls"], "walls_v3": ws3["walls"], "notes": ws["notes"]},
+           "depth_scale_source": "person range vs MoCap hip - TORSO_R (absolute, per camera); walls = cross-check",
+           "shared_walls_crosscheck": {"relative_scale_from_walls": {str(k): v for k, v in ws["scale"].items()}, "relative_scale_from_person": {"3/1": sp[3] / sp[1], "5/3": sp[5] / sp[3]}, "walls_v1": ws["walls"], "walls_v3": ws3["walls"], "notes": ws["notes"]},
            "landmark_experiment_rejected": {f"node_{n}": {"landmarks": lm[n], "fits": {m: {k: v for k, v in f.items() if k not in ("R_wc", "t_w")} for m, f in fits[n].items() if isinstance(f, dict)}, "reason": fits[n]["reason"]} for n in NODES},
            "cameras_v1_look_at_person": {f"node_{n}": {k: v for k, v in sol[n].items() if not k.startswith("_")} for n in NODES},
            "overlap_v3": ov_v3,
