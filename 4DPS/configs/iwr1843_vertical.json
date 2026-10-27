@@ -1,0 +1,161 @@
+{
+  "modulation_scheme": "FMCW",
+  "carrierFrequency": 77000000000.0,
+  "sampleRate": 4400000.0,
+  "freqSlope": 60012000000000.0,
+  "numAdcSamples": 256,
+  "adcStartTime": 0.0,
+  "rampEndTime": 7.2e-05,
+  "tx_array": [
+    {
+      "name": "TX1",
+      "pos_mm": [
+        14.026648,
+        0.0,
+        -0.973352
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX2",
+      "pos_mm": [
+        15.973352,
+        0.0,
+        -4.866761
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX3",
+      "pos_mm": [
+        14.026648,
+        0.0,
+        -8.760169
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    }
+  ],
+  "rx_array": [
+    {
+      "name": "RX1",
+      "pos_mm": [
+        14.026648,
+        0.0,
+        8.760169
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX2",
+      "pos_mm": [
+        14.026648,
+        0.0,
+        6.813465
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX3",
+      "pos_mm": [
+        14.026648,
+        0.0,
+        4.866761
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX4",
+      "pos_mm": [
+        14.026648,
+        0.0,
+        2.920056
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    }
+  ],
+  "hupr_provenance": {
+    "sensor": "TI IWR1843BOOST",
+    "radar_name": "vertical",
+    "coordinate_frame": "+Y boresight, +X right, +Z up",
+    "centre_m": [
+      0.015,
+      0.0,
+      0.0
+    ],
+    "board_roll_about_boresight_deg": 90.0,
+    "table_1": {
+      "physical_transmitters_printed": 4,
+      "physical_receivers_printed": 3,
+      "frequency_slope_mhz_per_us": 60.012,
+      "sample_rate_ksps": 4400,
+      "chirp_duration_us": 72,
+      "chirps_in_frame": 64,
+      "adc_samples": 256,
+      "frames_per_second": 10,
+      "maximum_range_m_approx": 11.0,
+      "range_resolution_m_printed": 0.048
+    },
+    "released_code": {
+      "physical_transmitters": 3,
+      "physical_receivers": 4,
+      "tdm_loops_per_frame": 64,
+      "physical_chirps_per_frame": 192,
+      "lvds_lanes": 2,
+      "angle_fft_bins": 64,
+      "elevation_fft_bins": 8
+    },
+    "derived": {
+      "wavelength_m": 0.0038934085454545454,
+      "range_bin_spacing_m": 0.042930437844722724,
+      "max_unambiguous_range_m": 10.990192088249017,
+      "adc_capture_duration_us": 58.18181818181818
+    },
+    "assumptions_requiring_alignment": [
+      "77 GHz carrier because exact HuPR start/centre frequency is unpublished",
+      "3 cm radar-centre baseline; paper only says the radars are kept as near as 3 cm",
+      "vertical-board roll sign and translation must be confirmed from scene/radar alignment"
+    ]
+  }
+}

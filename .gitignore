@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.so
+.build_stamp.json
+build/
+*.egg-info/
+.DS_Store
+
+# 4DPS snapshot: heavy, non-code dirs are mirrored to the node by rsync, not versioned
+4DPS/seeds/
+4DPS/models/
+4DPS/third_party/
+4DPS/outputs/
+
+# experiment outputs / derived products
+nbs/output/
+nbs/logs/
+data/
+runs/

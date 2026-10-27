@@ -1,0 +1,497 @@
+{
+  "modulation_scheme": "FMCW",
+  "carrierFrequency": 77000000000.0,
+  "sampleRate": 5000000.0,
+  "freqSlope": 64985000000000.0,
+  "numAdcSamples": 256,
+  "adcStartTime": 5e-06,
+  "rampEndTime": 6e-05,
+  "tx_array": [
+    {
+      "name": "TX1",
+      "pos_mm": [
+        30.252494,
+        0.0,
+        -5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX2",
+      "pos_mm": [
+        32.204268,
+        0.0,
+        -1.951774
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX3",
+      "pos_mm": [
+        34.156042,
+        0.0,
+        3.903548
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX4",
+      "pos_mm": [
+        -10.734756,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX5",
+      "pos_mm": [
+        -2.927661,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX6",
+      "pos_mm": [
+        4.879435,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX7",
+      "pos_mm": [
+        12.68653,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX8",
+      "pos_mm": [
+        20.493625,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX9",
+      "pos_mm": [
+        28.30072,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX10",
+      "pos_mm": [
+        36.107816,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX11",
+      "pos_mm": [
+        43.914911,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    },
+    {
+      "name": "TX12",
+      "pos_mm": [
+        51.722006,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "radius": 1.0
+    }
+  ],
+  "rx_array": [
+    {
+      "name": "RX1",
+      "pos_mm": [
+        -45.866685,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX2",
+      "pos_mm": [
+        -47.818458,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX3",
+      "pos_mm": [
+        -49.770232,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX4",
+      "pos_mm": [
+        -51.722006,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX5",
+      "pos_mm": [
+        51.722006,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX6",
+      "pos_mm": [
+        49.770232,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX7",
+      "pos_mm": [
+        47.818458,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX8",
+      "pos_mm": [
+        45.866685,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX9",
+      "pos_mm": [
+        -38.059589,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX10",
+      "pos_mm": [
+        -40.011363,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX11",
+      "pos_mm": [
+        -41.963137,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX12",
+      "pos_mm": [
+        -43.914911,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX13",
+      "pos_mm": [
+        30.252494,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX14",
+      "pos_mm": [
+        28.30072,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX15",
+      "pos_mm": [
+        26.348947,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    },
+    {
+      "name": "RX16",
+      "pos_mm": [
+        24.397173,
+        0.0,
+        5.855321
+      ],
+      "boresight": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "polarization": "V",
+      "power_dBm": 12.0
+    }
+  ],
+  "provenance": {
+    "radar_name": "cascade",
+    "coordinate_frame": "+Y boresight, +X azimuth (image right), +Z elevation (up)",
+    "centre_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "board_rotation_deg": 180.0,
+    "design_frequency_hz": 76800000000.0,
+    "half_wavelength_m": 0.0019517738151041666,
+    "tx_order": [
+      11,
+      10,
+      9,
+      8,
+      7,
+      6,
+      5,
+      4,
+      3,
+      2,
+      1,
+      0
+    ],
+    "azimuth_tx": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "azimuth_grid_slots": 86,
+    "angle_fft_bins": 128,
+    "sensor": "TI MMWCAS-RF-EVM, 12 TX x 16 RX, TDA2 capture",
+    "dataset": "RT-Pose (arXiv 2407.13930)",
+    "chirp_source": "RT-POSE repository data_processing/mmWave-Matlab/main/cascade/input/hardware_param.m",
+    "antenna_source": "the same file's TI_Cascade_{TX,RX}_position_{azi,ele} and TI_Cascade_RX_ID; identical to ColoRadar's antenna_cfg.txt (mmIR/3DPS)",
+    "rx_channel_order": "as recorded: master 0-3, slave1 4-7, slave2 8-11, slave3 12-15",
+    "tdm_order": "TxToEnable = [12 .. 1]: slot k of a loop carries TX 12-k",
+    "board_rotation": "180 degrees about boresight relative to ColoRadar's rig (paper Fig. 1); negates both antenna coordinates, as 3DPS's flip_upside_down does; verified from data by mm4DPS.qa orientation-check",
+    "chirp": {
+      "start_frequency_hz": 77000000000.0,
+      "adc_start_s": 5e-06,
+      "ramp_end_s": 6e-05,
+      "idle_s": 5e-06,
+      "interval_s": 6.5e-05,
+      "sample_rate_hz": 5000000.0,
+      "slope_hz_s": 64985000000000.0,
+      "samples": 256,
+      "loops": 64,
+      "frame_period_s": 0.1
+    },
+    "calibration": "mmwcas_calibration.npz (TI calibrateResults_high.mat): per-(TX, RX) range-offset and phase correction applied to the measured ADC before any product (TI calibrationCascade, phaseCalibOnly=1)",
+    "assumptions_requiring_alignment": [
+      "carrierFrequency is the 77 GHz start frequency, the 3DPS/ColoRadar convention",
+      "the radar extrinsic is not shipped with RT-Pose; it is estimated per sequence",
+      "the 180 degree board rotation is verified from data on the first sequence"
+    ]
+  }
+}

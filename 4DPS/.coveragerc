@@ -1,0 +1,8 @@
+[run]
+branch = True
+parallel = True
+source = /home/adnan/Desktop/hupr_radar_rendering_velocity/mm4DPS
+data_file = /home/adnan/Desktop/hupr_radar_rendering_velocity/.coverage
+disable_warnings = module-not-imported,no-data-collected
+[report]
+ignore_errors = True

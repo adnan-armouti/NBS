@@ -1,0 +1,60 @@
+# Anchored to the repository root. Without the leading slash these match at any
+# depth: "data/" once silently excluded third_party/3DPS_submission/mm3DPS/data,
+# a subpackage the renderer imports, and the clone failed at import time.
+
+# Run products. One sequence's four renders are about 44 GB, all regenerable.
+/outputs/
+
+# The same, but inside the package. Nothing should write here at all -- the
+# renderer's measured-cache default is anchored on mm4DPS.REPO_ROOT, not on the
+# file's depth -- but the depth-counting version put 2.7 GB of *_raw.npy here
+# and committed nine of them, so this stays as a backstop.
+/mm4DPS/outputs/
+
+# The HuPR dataset. Not ours to redistribute, and the repacked radar archives
+# are 0.88 GB each against GitHub's 100 MB per-file limit. README section 1 has
+# build_hupr_dataset_subset.py for rebuilding it.
+/data/
+
+# Fetched checkpoints: Depth-Anything 1.3 GB, SAM2 857 MB. See fetch_models.sh.
+/models/hf/
+/models/sam2/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Provided input, not derivable here: the GVHMR SMPL person geometry, 514 MB
+# for three sequences. GVHMR is an external monocular mesh-recovery step this
+# tree consumes rather than runs; see README section 1. It lives in seeds/ with
+# the other provided inputs, not in outputs/, because outputs/ is what a run
+# produces and this is not.
+/seeds/gvhmr_person_geometry/
+
+# coverage data, produced by the acceptance-run audit
+.coverage
+.coverage.*
+
+# Not published from this repository. models/ and seeds/ are provided inputs
+# (docs/ is published: it holds the metric definitions metrics.json needs.)
+# distributed separately (the 16 MB SMPL model, the 12 MB of seeded
+# calibrations, the 514 MB GVHMR geometry); third_party/ is the upstream 3DPS
+# submission and the HuPR official code, each with its own home; tests/ went
+# with the deployment strip; docs/ and latex/ stay with the source repository.
+/models/
+/seeds/
+/third_party/
+/tests/
+/latex/
+
+# Claude Code permission settings: local tooling with machine paths, not project content.
+/.claude/
+
+# Build stamps record the SHA-256 of the sources a LOCAL build consumed, so a
+# committed stamp describes whoever built last. Tracking it defeats its purpose:
+# `git checkout` then overwrites a correct local stamp with one that reports
+# "built and current" while the .so on disk came from different sources -- the exact
+# stale-extension failure cuda_ext.py's header says has cost this project twice.
+.build_stamp.json
+/baselines/rfgenesis/upstream/
+/baselines/**/outputs/

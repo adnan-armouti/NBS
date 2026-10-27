@@ -1,0 +1,28 @@
+{
+  "valid": true,
+  "errors": [],
+  "warnings": [
+    "HuPR Table 1 prints 4 TX / 3 RX; IWR1843 hardware and released code use 3 TX / 4 RX",
+    "Table parameters imply 0.04293 m range-bin spacing, not the paper's approximate 0.048 m"
+  ],
+  "geometry": {
+    "horizontal_array_axis": [
+      1.0,
+      0.0,
+      0.0
+    ],
+    "vertical_array_axis": [
+      0.0,
+      0.0,
+      -1.0
+    ],
+    "axis_dot": 0.0,
+    "centre_baseline_m": 0.03
+  },
+  "signal": {
+    "range_bin_spacing_m": 0.042930437844722724,
+    "max_unambiguous_range_m": 10.990192088249017,
+    "tdm_loops_per_frame": 64,
+    "physical_chirps_per_frame": 192
+  }
+}
