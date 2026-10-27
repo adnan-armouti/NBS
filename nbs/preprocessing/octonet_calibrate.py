@@ -390,8 +390,10 @@ def figure(sol: dict, clouds_as: dict, clouds_cal: dict, ov_as, ov_cal, out_png:
         ax.set_xlim(-7, 7); ax.set_ylim(-7, 7); ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]")
         ax.set_title(f"fused top-down, {lab}\nmedian NN dist: " + ", ".join(f"{k} {v['median_nn_m']:.2f} m" for k, v in ov.items()), fontsize=9)
     ax = axs[2, 2]; ax.axis("off")
-    txt = "\n".join(f"node_{n}: yaw {sol[n]['yaw_deg']:7.1f} (assumed {sol[n]['yaw_assumed_deg']:7.1f}) pitch {sol[n]['pitch_deg']:+5.1f} roll {sol[n]['roll_deg']:+5.1f} | floor h {sol[n]['floor_height_m']:.2f} vs z {sol[n]['node_marker_z_m']:.2f} | range ratio {sol[n]['range_cam_over_world']:.3f}" for n in NODES)
-    ax.text(0, 0.95, "octonet_calibrate summary (deg, m)\n" + txt + "\n\nPosition = node rigid body (camera offset from the marker centroid ignored).\nIntrinsics nominal D455; depth 8-bit 0-10 m.", va="top", family="monospace", fontsize=9)
+    txt = "\n".join(f"node_{n}: yaw {sol[n]['yaw_deg']:7.1f} (assumed {sol[n]['yaw_assumed_deg']:7.1f}) pitch {sol[n]['pitch_deg']:+5.1f} roll {sol[n]['roll_deg']:+5.1f} | depth scale {sol[n].get('depth_scale', 1.0):.3f} | floor h {sol[n]['floor_height_m']:.2f} vs marker z {sol[n]['node_marker_z_m']:.2f} -> z off {sol[n].get('offset_z_m', 0.0):+.2f}" for n in NODES)
+    ax.text(0, 0.95, "octonet_calibrate summary (deg, m)\n" + txt + "\n\nPosition = node rigid body + vertical offset from the floor; horizontal camera-marker offset unobservable (0).\n"
+            "Depth scale per camera from the person range (body surface = MoCap hip - 0.12 m), cross-checked by the walls two cameras share.\n"
+            "Range check = surface range / hip range after the scale (expected ~0.96). Intrinsics nominal D455; depth 8-bit 0-10 m x scale.", va="top", family="monospace", fontsize=8.5)
     fig.suptitle("OctoNet Scene 1 RGB-D extrinsics: floor plane -> pitch/roll, MoCap-synchronised person -> yaw", fontsize=13)
     fig.tight_layout(); fig.savefig(out_png, dpi=150); plt.close(fig)
 

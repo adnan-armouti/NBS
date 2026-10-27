@@ -51,8 +51,12 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   Camera orientations are calibrated by `nbs/preprocessing/octonet_calibrate.py` (floor plane → pitch/roll,
   MoCap-synchronised person → yaw; yaw spread < 1°; results in `viz/README.md`). `octonet_scene.camera_pose`
   returns the calibrated pose when `$NBS_DATA_OUT/calib_S1/extrinsics.json` exists (copy in `nbs/assets/`),
-  else the look-at-origin assumption; figure titles must print `pose_source()`. The radar/UWB on node_1 share
-  the camera yaw by assumption; the camera-to-marker offset is ignored (node 5 reads 10 % long).
+  else the look-at-origin assumption; figure titles must print `pose_source()`. Each camera has a **depth scale**
+  (measured = scale × true: 1.027 / 1.075 / 1.167 for nodes 1/3/5, from the person range with the body-surface
+  correction, confirmed by shared walls): always decode depth with `octonet_scene.load_depth_m_calibrated(png, node)`.
+  Horizontal camera-to-marker offsets are unobservable (0). The subject walks IN PLACE: motion foregrounds are empty.
+- SFCW objective = `nbs/method/sfcw_target.py` (clutter-guarded temporal-mean channel, pooled over recordings,
+  per-bin cross-recording reliability; residual is drift with n_eff ≈ 4 frames). Details in `viz/README.md`.
 - RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
   (nominal D455 87°×58°). Per-node clip stamps differ by ~1 s: resolve paths via `cut_manual.csv`
