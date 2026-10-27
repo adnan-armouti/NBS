@@ -1,4 +1,4 @@
-scene_scaffold_topdown.png: fused static scaffold from the 3 RGB-D nodes (temporal median over 30 frames of the walk clip, person column cut), coloured by source camera; node rigid bodies from the OptiTrack CSV; camera poses ASSUMED (position = node marker, axis aimed at the origin).
+scene_scaffold_topdown.png: fused static scaffold from the 3 RGB-D nodes (temporal median over 30 frames of the walk clip, person column cut), coloured by source camera; node rigid bodies from the OptiTrack CSV; camera poses: calibrated extrinsics (octonet_calibrate: floor-plane pitch/roll + MoCap-synchronised person yaw; position = node rigid body).
 
 scene_scaffold_3d.png: the same fused scaffold in 3-D with the five node positions (squares, Z = mounting height).
 
@@ -8,4 +8,4 @@ person_skeleton.png: MoCap skeleton (joint order = OptiTrack CSV bone order, ver
 
 init_pipeline.png: block diagram of the initialisation pipeline (scene: RGB-D -> median -> back-project -> assumed pose -> fuse -> person cut -> scaffold; person: MoCap -> skeleton); dashed boxes are pending (octonet_calibrate, SMPL fit).
 
-scaffold saved: /data/mmsd/NBS/data/OctoNet/scaffold_S1_assumed  (50032 points)
+scaffold saved: /data/mmsd/NBS/data/OctoNet/scaffold_S1_calibrated  (54631 points)

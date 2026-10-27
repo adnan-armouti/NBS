@@ -14,8 +14,9 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   974 Vayyar / 976 MoCap clips), products `/data/mmsd/NBS/data`, scratch `/ephemeral/scratch`.
   **Always `source tools/env_node.sh` first** (PYTHONPATH override, gcc-12, ARCH 9.0, data roots).
   Python = `/data/mmsd/envs/nbs/bin/python` (venv overlay on `mm4dps`: torch 2.9.1 cu128, numpy 1.26).
-  The node cannot reach GitHub: push from the workstation with `git push node main`; pull node commits
-  back with `git pull node main`. If `ssh mmsd-h100` says publickey denied: `brev login && brev refresh`.
+  The node cannot reach GitHub: push from the workstation with `tools/push_node.sh` (it first discards the
+  figures the node regenerated under `viz/`, which otherwise block the updateInstead push); pull node commits
+  back with `git pull node main`. The subject walks IN PLACE, so motion-based foregrounds are empty. If `ssh mmsd-h100` says publickey denied: `brev login && brev refresh`.
 - **Workstation**: `/home/adnan/Desktop/mmSD/NBS` (this checkout), GitHub `origin`
   (`adnan-armouti/NBS`). Figures are produced on the node (`python -m viz.<group>` from `nbs/`, scripts in `nbs/viz/`) and rsync'd back into `viz/` here.
 - Sensors per OctoNet node (from the data): node_1 Vayyar+UWB+RGB-D+WiFi+IRA+acoustic+thermal+polar;
@@ -47,8 +48,11 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   (`mocap_csv_final/mocap_S1/**/*.csv`) carry rigid bodies `Node1`..`Node5`, constant across Scene-1 takes;
   see `nbs/preprocessing/octonet_scene.py` (`NODE_POS_S1`, `load_rigid_bodies`). Scenes 2/3 CSVs have no
   node bodies. WiFi Tx/Rx and the obstacle are NOT tracked: schematic from paper Fig. 2(a) only (±0.5 m).
-  Camera/radar orientations are still unknown (assumed: at the node, looking at the origin) until
-  `octonet_calibrate.py` exists.
+  Camera orientations are calibrated by `nbs/preprocessing/octonet_calibrate.py` (floor plane → pitch/roll,
+  MoCap-synchronised person → yaw; yaw spread < 1°; results in `viz/README.md`). `octonet_scene.camera_pose`
+  returns the calibrated pose when `$NBS_DATA_OUT/calib_S1/extrinsics.json` exists (copy in `nbs/assets/`),
+  else the look-at-origin assumption; figure titles must print `pose_source()`. The radar/UWB on node_1 share
+  the camera yaw by assumption; the camera-to-marker offset is ignored (node 5 reads 10 % long).
 - RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
   (nominal D455 87°×58°). Per-node clip stamps differ by ~1 s: resolve paths via `cut_manual.csv`
