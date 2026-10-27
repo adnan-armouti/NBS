@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from preprocessing import octonet_scene as S, octonet_io as IO, octonet_config as C
 from preprocessing import vayyar_radar_config as VR
+POSE = S.pose_source()
+POSE_LABEL = {"assumed": "assumed extrinsics", "calibrated": "calibrated extrinsics (octonet_calibrate)"}[POSE]
 from method import sfcw_forward as SF, wifi_forward as WF
 from method.freq_material import ITU_GT, C_LIGHT
 from mm3DPS.data import ra_utils as RA
@@ -40,7 +42,7 @@ def db(x, floor=DB_FLOOR):
 
 # ----------------------------------------------------------------------------- scaffold
 def load_or_build_scaffold(n_max=20000):
-    p = os.path.join(os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT), "scaffold_S1_assumed", "pcl.npy")
+    p = os.path.join(os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT), f"scaffold_S1_{POSE}", "pcl.npy")
     if os.path.exists(p):
         pcl = np.load(p)[:, :3]; src = f"geometry group scaffold {p}"
     else:
@@ -48,7 +50,7 @@ def load_or_build_scaffold(n_max=20000):
         sel = fr[:: max(1, len(fr) // 20)][:20]
         z = np.median(np.stack([S.load_depth_m(f) for f in sel]), axis=0)
         pcl = S.cam_to_world(S.backproject(z, stride=3), 1)
-        src = f"node_1 depth temporal median of {len(sel)} frames of REC_WALK ({os.path.basename(d)}), nominal D455 intrinsics, assumed pose"
+        src = f"node_1 depth temporal median of {len(sel)} frames of REC_WALK ({os.path.basename(d)}), nominal D455 intrinsics, " + POSE_LABEL
     r_xy = np.linalg.norm(pcl[:, :2], axis=1)
     pcl = pcl[(r_xy > 0.7) & (pcl[:, 2] > -0.3) & (pcl[:, 2] < 3.0)]          # drop the subject column + outliers
     rng = np.random.default_rng(0)
@@ -79,7 +81,7 @@ def sfcw():
     ra_gt = RA.vayyar_to_ra_complex(rp_s_txrx, n_az=128).abs().numpy(); ra_gt[:, ~guard] = np.nan
     # rendered
     pcl = load_or_build_scaffold()
-    radar = S.NODE_POS_S1[1]; bore = -radar[:2] / np.linalg.norm(radar[:2]); bore = np.array([bore[0], bore[1], 0.0])
+    R1, radar, _ = S.camera_pose(1); bore = R1[:, 2].copy(); bore[2] = 0.0; bore /= np.linalg.norm(bore)   # radar shares node_1 camera yaw (assumption), horizontal
     cfg = VR.build_config(radar_pos=radar, boresight=bore)
     tx = torch.tensor([a["pos_mm"] for a in cfg["tx_array"]], dtype=torch.float64, device=DEV) / 1000
     rx = torch.tensor([a["pos_mm"] for a in cfg["rx_array"]], dtype=torch.float64, device=DEV) / 1000
@@ -112,14 +114,14 @@ def sfcw():
     a.set_title("GT static RA |.| (elevation marginalized)"); plt.colorbar(im, ax=a, label="dB")
     a = ax[1, 0]; a.plot(r_axis, db(np.nan_to_num(prof_r, nan=0)), lw=1.4, color="C1")
     a.axvline(SUBJECT_R, color="r", ls="--", lw=1); a.set_ylim(DB_FLOOR, 1); a.set_xlabel("range (m)"); a.set_ylabel("|range profile| (dB rel. max)")
-    a.set_title("rendered (assumed extrinsics, uniform material)\nsfcw_forward.render_sfcw_pairs on the static scaffold, mean over 400 pairs"); a.grid(alpha=.3)
+    a.set_title(f"rendered ({POSE_LABEL}, uniform material)\nsfcw_forward.render_sfcw_pairs on the static scaffold, mean over 400 pairs"); a.grid(alpha=.3)
     a = ax[1, 1]; a.scatter(sx, sy, s=1, c=pcl[:, 2], cmap="coolwarm"); a.scatter([0], [0], marker="^", c="k", s=80, label="Vayyar (node_1)")
     a.scatter([0], [SUBJECT_R], marker="x", c="r", s=60, label="subject spot"); a.set_aspect("equal"); a.set_xlabel("azimuth x (m, radar frame)"); a.set_ylabel("boresight y (m)")
     a.set_title(f"scaffold rendered ({len(pcl)} pts, colour = height)"); a.legend(loc="lower right"); a.grid(alpha=.3)
     a = ax[1, 2]; im = a.imshow(db(np.nan_to_num(ra_r, nan=0)).T, aspect="auto", origin="lower", cmap="viridis",
                               extent=[az[0], az[-1], r_axis[0], r_axis[-1]], vmin=DB_FLOOR, vmax=0)
     a.axhline(SUBJECT_R, color="r", ls="--", lw=1); a.set_xlabel("azimuth (deg)"); a.set_ylabel("range (m)")
-    a.set_title("rendered RA |.| (assumed extrinsics, uniform material)"); plt.colorbar(im, ax=a, label="dB")
+    a.set_title(f"rendered RA |.| ({POSE_LABEL}, uniform material)"); plt.colorbar(im, ax=a, label="dB")
     fig.suptitle(f"SFCW (Vayyar IMAGEVK-74, 63-67 GHz, 20x20) — recording {REC} (subject 2, sit) — static scene only", fontsize=13)
     fig.tight_layout(); fig.savefig(os.path.join(OUT, "sfcw_gt_vs_rendered.png"), dpi=160); plt.close(fig)
     pk_gt = r_axis[np.nanargmax(prof_s)]; pk_r = r_axis[np.nanargmax(prof_r)]
@@ -152,7 +154,7 @@ def uwb(pcl):
     a = ax[k]; a.plot(r, db(cir), lw=1, color="C1"); a.axvline(SUBJECT_R, color="r", ls="--", lw=1); a.set_ylim(DB_FLOOR, 1)
     a.set_xlabel("range (m)"); a.set_ylabel("|CIR| (dB rel. max)")
     a.set_title("rendered: PROTOTYPE incoherent pulse-sum on the static scaffold\n(Gaussian 2.5 GHz pulse, 1/R^4) — NOT a 4DPS head (pending)", fontsize=10); a.grid(alpha=.3)
-    fig.suptitle(f"UWB — recording {REC} — assumed radar pose = node_1 rigid body", fontsize=12)
+    fig.suptitle(f"UWB — recording {REC} — radar pose = node_1 rigid body + node_1 camera yaw ({POSE})", fontsize=12)
     fig.tight_layout(); fig.savefig(os.path.join(OUT, "uwb_gt_vs_rendered.png"), dpi=160); plt.close(fig)
     pk = r[np.argmax(mag.mean(0)[20:]) + 20]
     CAP.append(f"uwb_gt_vs_rendered.png: pickle holds {len(frames)} frame(s) x {nb} bins (paper Tab. 2: 1x1535, 17 Hz — the per-recording pickle apparently stores one frame). GT peak (beyond bin 20) at {pk:.2f} m. Rendered is a PROTOTYPE incoherent pulse-sum, not a 4DPS head; UWB radar position/orientation assumed = node_1.")
@@ -203,6 +205,6 @@ if __name__ == "__main__":
     uwb(pcl); wifi(pcl)
     CAP.insert(0, f"Recording {REC} (Scene 1, subject 2, 'sit'); frame = MoCap world (Z up, origin = subject spot); node_1 rigid body at {np.round(S.NODE_POS_S1[1],3).tolist()} m, {SUBJECT_R:.2f} m from the subject spot.")
     CAP.append("Wi-Fi GT notches at fixed subcarriers are the HT40 null/pilot subcarriers (not propagation); the rendered CSI has no such notches. The GT CIR tap spacing is 7.5 m (40 MHz), far coarser than the room, so only the first 1-2 taps are informative.")
-    CAP.append("Global caveats: sensor extrinsics are ASSUMED (node position, boresight toward origin, horizontal) pending octonet_calibrate; material uniform (ITU concrete / const reflectivity), normal incidence, no normals; single bounce; no LOS/occlusion in the splat; Wi-Fi Tx/Rx and the obstacle are schematic from paper Fig. 2(a).")
+    CAP.append(f"Global caveats: sensor extrinsics = {POSE_LABEL} (position = node rigid body; the radar/UWB share node_1 camera yaw by assumption); material uniform (ITU concrete / const reflectivity), normal incidence, no normals; single bounce; no LOS/occlusion in the splat; Wi-Fi Tx/Rx and the obstacle are schematic from paper Fig. 2(a).")
     open(os.path.join(OUT, "captions.txt"), "w").write("\n".join(CAP) + "\n")
     print("\n".join(CAP))

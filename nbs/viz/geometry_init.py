@@ -22,7 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(REPO, "viz", "geometry_init")
 os.makedirs(OUT, exist_ok=True)
-DATA_OUT = os.path.join(os.environ.get("NBS_DATA_OUT", os.path.join(REPO, "data", "OctoNet")), "scaffold_S1_assumed")
+POSE = S.pose_source()
+POSE_LABEL = {"assumed": "assumed extrinsics (node rigid-body position + look-at origin; no calibration)",
+              "calibrated": "calibrated extrinsics (octonet_calibrate: floor-plane pitch/roll + MoCap-synchronised person yaw; position = node rigid body)"}[POSE]
+DATA_OUT = os.path.join(os.environ.get("NBS_DATA_OUT", os.path.join(REPO, "data", "OctoNet")), f"scaffold_S1_{POSE}")
 os.makedirs(DATA_OUT, exist_ok=True)
 
 CAM_NODES = (1, 3, 5)
@@ -31,7 +34,7 @@ STRIDE = 3
 VOXEL = 0.05
 PERSON_R, PERSON_ZMAX = 0.7, 2.2
 CAM_COLORS = {1: "tab:red", 3: "tab:green", 5: "tab:blue"}
-NOTE = "assumed extrinsics (node rigid-body position + look-at origin; no calibration yet)"
+NOTE = POSE_LABEL
 
 # npy joint order == OptiTrack CSV bone order (verified: 0.0 mm difference on frame 0 of the 'sit' take)
 JOINTS = ["Hip", "Chest", "Neck", "Head", "LShoulder", "LUArm", "LFArm", "LHand", "RShoulder", "RUArm",
@@ -118,7 +121,7 @@ def build_scaffold():
         keep = (~pm) & (w[:, 2] > -0.1) & (w[:, 2] < 3.0)
         per_cam[n] = dict(med=med, cam=cam, w=w, idx=idx, person=pm, keep=keep)
         fused.append(w[keep]); src.append(np.full(keep.sum(), n))
-        R, t = S.camera_pose_assumed(n)
+        R, t, _ = S.camera_pose(n)
         meta["cameras"][f"node_{n}"] = {"clip": clip, "frames": sel, "R_wc": R.tolist(), "t_w": t.tolist(),
                                         "points_kept": int(keep.sum())}
     fused = np.concatenate(fused); src = np.concatenate(src)
@@ -161,7 +164,7 @@ def fig_scaffold(down, dsrc):
     fig.tight_layout(); fig.savefig(os.path.join(OUT, "scene_scaffold_topdown.png"), dpi=170); plt.close(fig)
     captions.append("scene_scaffold_topdown.png: fused static scaffold from the 3 RGB-D nodes (temporal median over "
                     f"{N_FRAMES} frames of the walk clip, person column cut), coloured by source camera; node rigid bodies "
-                    "from the OptiTrack CSV; camera poses ASSUMED (position = node marker, axis aimed at the origin).")
+                    "from the OptiTrack CSV; camera poses: " + POSE_LABEL + ".")
 
     fig = plt.figure(figsize=(10, 8)); ax = fig.add_subplot(111, projection="3d")
     sub = np.random.default_rng(0).choice(len(down), min(len(down), 40000), replace=False)
@@ -272,7 +275,7 @@ def fig_pipeline():
     arrow(5.2, 5.4, 5.7, 5.4)
     box(5.7, 4.6, 2.2, 1.6, "back-project\nnominal D455 intrinsics\n87 x 58 deg FoV\n(not shipped)")
     arrow(7.9, 5.4, 8.4, 5.4)
-    box(8.4, 4.6, 2.4, 1.6, "camera -> MoCap frame\nASSUMED pose:\nnode rigid body (CSV)\n+ look-at origin", fc="#fff4e5")
+    box(8.4, 4.6, 2.4, 1.6, ("camera -> MoCap frame\nCALIBRATED pose:\nnode rigid body (CSV)\n+ floor pitch/roll\n+ person yaw" if POSE == "calibrated" else "camera -> MoCap frame\nASSUMED pose:\nnode rigid body (CSV)\n+ look-at origin"), fc=("#e8f5e9" if POSE == "calibrated" else "#fff4e5"))
     arrow(10.8, 5.4, 11.3, 5.4)
     box(11.3, 4.6, 1.6, 1.6, "fuse\n3 clouds")
     arrow(12.9, 5.4, 13.4, 5.4)
