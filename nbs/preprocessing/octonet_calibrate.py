@@ -90,26 +90,38 @@ def level_rotation(psi: float) -> np.ndarray:
     return np.stack([right, np.array([0, 0, -1.0]), fwd], 1)
 
 
-def person_observations(node: int, rec: str, bg: np.ndarray, frames: list[str], K: S.Intrinsics):
+def person_observations(node: int, rec: str, bg: np.ndarray, frames: list[str], K: S.Intrinsics,
+                        R_tilt: np.ndarray, h_floor: float, t_w: np.ndarray):
+    """Person = the largest blob of pixels at the MoCap-predicted camera range (+-0.6 m), standing
+    0.2..2.0 m above the fitted floor. (The subject walks IN PLACE, so they are part of the temporal
+    median and a motion-based foreground is empty.) Returns the blob's mean 3-D point per frame."""
     from scipy import ndimage
     pos, tm = IO.load_mocap(os.path.join(C.OCTONET_ROOT, "mocap_pose",
                             os.path.splitext(os.path.basename(S.index_row(rec)["mocap_data_path"]))[0] + "_skeleton.npy"))
     hip = pos[:, 0, :]
-    obs = []
+    obs, dts = [], []
+    H, W = bg.shape; v, u = np.mgrid[0:H:2, 0:W:2]
     for p in [frames[i] for i in np.linspace(len(frames) * 0.1, len(frames) * 0.9, K_PERSON).astype(int)]:
-        te = _epoch_of_depth_png(p); j = int(np.argmin(np.abs(tm - te)))
-        if abs(tm[j] - te) > 0.1: continue
-        D = S.load_depth_m(p)
-        fg = (bg > 0) & (D > 1.0) & (D < 6.0) & (bg - D > FG_THRESH)
-        fg = ndimage.binary_opening(fg, iterations=2)
-        lab, n = ndimage.label(fg)
+        te = _epoch_of_depth_png(p); j = int(np.argmin(np.abs(tm - te))); dts.append(abs(tm[j] - te))
+        if abs(tm[j] - te) > 0.25: continue
+        D = S.load_depth_m(p)[::2, ::2]
+        r_exp = float(np.linalg.norm(hip[j] - t_w))
+        P = np.stack([(u - K.cx) / K.fx * D, (v - K.cy) / K.fy * D, D], -1)        # (h,w,3) camera frame
+        q = P @ R_tilt.T                                                           # levelled
+        height = h_floor - q[..., 1]
+        rng = np.linalg.norm(q, axis=-1)
+        m = (D > 0.5) & (np.abs(rng - r_exp) < 0.6) & (height > 0.2) & (height < 2.0)
+        m = ndimage.binary_opening(m, iterations=1)
+        lab, n = ndimage.label(m)
         if n == 0: continue
-        sizes = ndimage.sum(fg, lab, range(1, n + 1)); k = int(np.argmax(sizes)) + 1
-        if sizes[k - 1] < 1500: continue
-        m = lab == k; vv, uu = np.nonzero(m); zc = float(np.median(D[m]))
-        u0, v0 = float(uu.mean()), float(vv.mean())
-        pc = np.array([(u0 - K.cx) / K.fx * zc, (v0 - K.cy) / K.fy * zc, zc])
-        obs.append(dict(png=os.path.basename(p), t=te, hip=hip[j].tolist(), p_cam=pc.tolist(), uv=[u0, v0], area=int(sizes[k - 1])))
+        sizes = ndimage.sum(m, lab, range(1, n + 1)); k = int(np.argmax(sizes)) + 1
+        if sizes[k - 1] < 400: continue
+        blob = lab == k; pc = P[blob].mean(0); vv, uu = np.nonzero(blob)
+        obs.append(dict(png=os.path.basename(p), t=te, dt=float(abs(tm[j] - te)), hip=hip[j].tolist(), p_cam=pc.tolist(),
+                        uv=[float(uu.mean() * 2), float(vv.mean() * 2)], area=int(sizes[k - 1]),
+                        blob_height_m=float(height[blob].max() - height[blob].min())))
+    print(f"  node_{node}: depth<->mocap |dt| min {min(dts):.3f} s, median {np.median(dts):.3f} s; {len(obs)} person blobs, "
+          f"blob heights {[round(o['blob_height_m'],2) for o in obs][:6]}")
     return obs
 
 
@@ -118,7 +130,7 @@ def solve_node(node: int, rec: str):
     bg, frames = median_background(node, rec)
     n_c, d, Q, inl_frac, n_cand = ransac_floor(bg, K)
     R_tilt = tilt_rotation(n_c); h_floor = abs(d)
-    obs = person_observations(node, rec, bg, frames, K)
+    obs = person_observations(node, rec, bg, frames, K, R_tilt, h_floor, t_w)
     if len(obs) < 3: raise RuntimeError(f"node_{node}: only {len(obs)} person observations")
     psis, rng_cam, rng_w, elev = [], [], [], []
     for o in obs:
