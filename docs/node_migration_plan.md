@@ -1,5 +1,11 @@
 # Plan — continue NBS on the NVIDIA Brev node (`mmsd-h100`)
 
+> **Done 2026-10-27:** Phases 1–2 executed with the repo relocated to `/home/adnan/Desktop/mmSD/NBS` (GitHub `adnan-armouti/NBS`),
+> node copy `/data/mmsd/NBS/code`, venv `/data/mmsd/envs/nbs` (numpy 1.26.4 / open3d 0.19 pinned), 4DPS snapshot in `4DPS/`
+> with both CUDA extensions built (ARCH 9.0). Layout names changed: `nbs/` (was `reference_code/NBS`), `4DPS/` (was
+> `reference_code/4DPS`). Phase 3 (viz) runs via `nbs/viz/*.py`. Decisions D1–D4 resolved by the user: un-ignore (new repo),
+> venv overlay, viz first, PDF in `pdf/`.
+
 > Written 2026-10-27 for the user. Supersedes the "BLOCKER" sections of `md/viz_octonet_prompt.md`
 > and `md/port_4dps_prompt.md`: the OctoNet data is not lost, it was moved. Everything below was
 > checked live on the node today. Execute Phases 1–2 before running either prompt.

@@ -1,5 +1,11 @@
 # Prompt — Port 4DPS into NBS and adapt it to OctoNet (SFCW / UWB / WiFi)
 
+> **Status 2026-10-27 (node migration):** the BLOCKER below is obsolete — OctoNet is intact on `mmsd-h100` at
+> `/data/mmsd/datasets/OctoNet/OctoNet-upload` and this repo runs there (`tools/env_node.sh`, `python -m viz.<group>`
+> from `nbs/`). Node positions come from the OptiTrack CSV rigid bodies (`nbs/preprocessing/octonet_scene.py`), not only
+> the paper; depth PNGs are 8-bit 0–10 m; RGB video is not shipped. Paths: `reference_code/NBS/...` → `nbs/...`,
+> `reference_code/4DPS/` → `4DPS/`, `viz/` → this repo's `viz/`. See `CLAUDE.md` and `docs/node_migration_plan.md`.
+
 > Self-contained task prompt for a fresh Claude Code session. Project: `/home/adnan/Desktop/NBS`.
 > Read `CLAUDE.md` and `WRITE_UP.md` (obstacles #15–#19b) first. This prompt contains BOTH the copy
 > task and the adaptation plan; get the copy + Part B (plan) reviewed by the user before writing

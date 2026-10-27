@@ -17,7 +17,7 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   The node cannot reach GitHub: push from the workstation with `git push node main`; pull node commits
   back with `git pull node main`. If `ssh mmsd-h100` says publickey denied: `brev login && brev refresh`.
 - **Workstation**: `/home/adnan/Desktop/mmSD/NBS` (this checkout), GitHub `origin`
-  (`adnan-armouti/NBS`). Figures are produced on the node and rsync'd back into `viz/` here.
+  (`adnan-armouti/NBS`). Figures are produced on the node (`python -m viz.<group>` from `nbs/`, scripts in `nbs/viz/`) and rsync'd back into `viz/` here.
 - Sensors per OctoNet node (from the data): node_1 Vayyar+UWB+RGB-D+WiFi+IRA+acoustic+thermal+polar;
   node_2 WiFi; node_3 RGB-D+WiFi+thermal; node_4 WiFi+ToF+acoustic; node_5 RGB-D. (All have IRA + TI mmWave.)
 
@@ -36,11 +36,27 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   phase-decorrelated at 3.1 Hz; `docs/WRITE_UP.md` #19). SFCW targets static scene + material only; never
   imply a human return. UWB/WiFi may see the person — test detectability before building a person term.
 - MoCap `mocap_pose/*_skeleton.npy` = dict `{timestamps, positions}`, `(F,20,3)` **mm**, Z-up,
-  floor-referenced, 125 Hz, timestamps ISO strings; **XY is recentered on the subject** (pose + height only,
-  not room position). Pickled by numpy 2 → `octonet_io.numpy2_compat()` under numpy 1.x.
+  floor-referenced, 125 Hz, timestamps ISO strings. The npy equals the OptiTrack CSV skeleton (verified 0.0 mm):
+  the subject simply stands at the MoCap origin (earlier notes said "XY recentered"; same effect: pose + height).
+  Joint order = CSV bone order: Hip, Chest, Neck, Head, L/R Shoulder-UArm-FArm-Hand, L/R Thigh-Shin-Foot-Toe.
+  Pickled by numpy 2 → `octonet_io.numpy2_compat()` under numpy 1.x.
+- Viz results and the open items they expose: `viz/README.md`. Assumed-pose scaffold on the node:
+  `/data/mmsd/NBS/data/OctoNet/scaffold_S1_assumed/pcl.npy`.
 - `cut_manual.csv` at the data root is the master join table (976 rows; 974 have Vayyar + MoCap).
-- Sensor extrinsics are NOT in the data: node positions come from the paper in `pdf/`;
-  `octonet_calibrate.py` (RGB-D ↔ room geometry) does not exist yet.
+- **Node positions ARE in the data** (correcting the older notes): the OptiTrack CSV exports
+  (`mocap_csv_final/mocap_S1/**/*.csv`) carry rigid bodies `Node1`..`Node5`, constant across Scene-1 takes;
+  see `nbs/preprocessing/octonet_scene.py` (`NODE_POS_S1`, `load_rigid_bodies`). Scenes 2/3 CSVs have no
+  node bodies. WiFi Tx/Rx and the obstacle are NOT tracked: schematic from paper Fig. 2(a) only (±0.5 m).
+  Camera/radar orientations are still unknown (assumed: at the node, looking at the origin) until
+  `octonet_calibrate.py` exists.
+- RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
+  ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
+  (nominal D455 87°×58°). Per-node clip stamps differ by ~1 s: resolve paths via `cut_manual.csv`
+  (`octonet_scene.modality_path`).
+- UWB (Novelda X4M200, node_1): pickle dict `{frame: 1535 floats, timestamp}`, 2.5 GHz BW, 9.9 m max.
+  WiFi: per receiver k (stored under `node_k/wifi`) dict `{timestamp: list(F), data: (F,2,114) complex}`,
+  ch 36 / 5.18 GHz / 40 MHz, Rx-4 NLOS behind a 3 cm board.
+- OctoNet's own loader code: GitHub `aiot-lab/OctoNet` (`dataset_loader.py`).
 
 ## Key docs
 `docs/node_migration_plan.md` (how the node is set up), `docs/prompts/viz_octonet_prompt.md`,
