@@ -48,7 +48,7 @@ def load_or_build_scaffold(n_max=20000):
     else:
         d = S.depth_clip_dir(1, S.REC_WALK); fr = S.depth_frames(d)
         sel = fr[:: max(1, len(fr) // 20)][:20]
-        z = np.median(np.stack([S.load_depth_m(f) for f in sel]), axis=0)
+        z = np.median(np.stack([S.load_depth_m_calibrated(f, 1) for f in sel]), axis=0)
         pcl = S.cam_to_world(S.backproject(z, stride=3), 1)
         src = f"node_1 depth temporal median of {len(sel)} frames of REC_WALK ({os.path.basename(d)}), nominal D455 intrinsics, " + POSE_LABEL
     r_xy = np.linalg.norm(pcl[:, :2], axis=1)

@@ -24,7 +24,7 @@ OUT = os.path.join(REPO, "viz", "geometry_init")
 os.makedirs(OUT, exist_ok=True)
 POSE = S.pose_source()
 POSE_LABEL = {"assumed": "assumed extrinsics (node rigid-body position + look-at origin; no calibration)",
-              "calibrated": "calibrated extrinsics (octonet_calibrate: floor-plane pitch/roll + MoCap-synchronised person yaw; position = node rigid body)"}[POSE]
+              "calibrated": "calibrated extrinsics (octonet_calibrate: floor pitch/roll, MoCap-person yaw + per-camera depth scale; position = node rigid body + floor height)"}[POSE]
 DATA_OUT = os.path.join(os.environ.get("NBS_DATA_OUT", os.path.join(REPO, "data", "OctoNet")), f"scaffold_S1_{POSE}")
 os.makedirs(DATA_OUT, exist_ok=True)
 
@@ -50,7 +50,7 @@ def median_depth(node: int, rec: str):
     clip = S.depth_clip_dir(node, rec)
     frames = S.depth_frames(clip)
     sel = [frames[i] for i in np.linspace(0, len(frames) - 1, N_FRAMES).astype(int)]
-    stack = np.stack([S.load_depth_m(p) for p in sel])              # (F,H,W)
+    stack = np.stack([S.load_depth_m_calibrated(p, node) for p in sel])   # (F,H,W), per-camera depth scale divided out
     stack[stack <= 0] = np.nan
     med = np.nanmedian(stack, axis=0)
     valid = np.isfinite(stack).mean(0) >= 0.5
