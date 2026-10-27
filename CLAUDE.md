@@ -64,6 +64,10 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
 - UWB (Novelda X4M200, node_1): pickle dict `{frame: 1535 floats, timestamp}`, 2.5 GHz BW, 9.9 m max.
   WiFi: per receiver k (stored under `node_k/wifi`) dict `{timestamp: list(F), data: (F,2,114) complex}`,
   ch 36 / 5.18 GHz / 40 MHz, Rx-4 NLOS behind a 3 cm board.
+- **Vayyar array layout is unverified**: the direct-coupling structure shows the 20 Tx in two sub-groups, not the
+  uniform-pitch line assumed in `vayyar_radar_config`. No RA/azimuth-based loss until the real IMAGEVK-74 element
+  coordinates are in; fit on pair-wise range profiles (`sfcw_target`, `kind='logmag'`). Radar/UWB mount yaw on
+  node_1 = camera yaw by assumption (sweep was flat, `octonet_mount_yaw.py`).
 - OctoNet's own loader code: GitHub `aiot-lab/OctoNet` (`dataset_loader.py`).
 
 ## Key docs

@@ -54,12 +54,14 @@ Tx pitch assumptions are verified (mount-yaw check).
 ## render_vs_gt/ — measured vs rendered
 - `sfcw_gt_vs_rendered.png` — GT: clutter-removed static range profile (bins 0–5 and the last 6 guarded), residual time–range map, static RA. Rendered: `sfcw_forward.render_sfcw_pairs` on the calibrated scaffold (Vayyar array at node_1, uniform ITU concrete). GT is coupling/sidelobe dominated (peak 0.22 m). Nothing at 2.92 m in either, as expected. Pair order tx-major + uniform Tx pitch are assumptions (azimuth only).
 - `sfcw_static_target.png` — the SFCW target definition: split halves, per-bin reliability / SNR, pooled vs single recording, residual autocorrelation.
+- `mount_yaw_sweep.png` — node_1 Vayyar / UWB boresight sweeps vs the measured static returns, and the Tx×Rx direct-coupling heat maps (pair-order check).
 - `uwb_gt_vs_rendered.png` — GT CIR vs range (bin 0.64 cm; the per-recording pickle holds ONE 1535-bin frame). Rendered = PROTOTYPE incoherent pulse-sum, not a 4DPS head (pending).
 - `wifi_gt_vs_rendered.png` — per receiver: GT |CSI| (frame + temporal mean, both antennas) and CIR; rendered `wifi_forward.render_csi` with schematic Tx/Rx. GT notches are HT40 null/pilot subcarriers; 40 MHz gives 7.5 m taps, so only the first 1–2 are informative. Rx-4 (NLOS) GT is not visibly suppressed.
 - `captions.txt`
 
 ## Open items these figures expose
-1. Radar/UWB mount orientation on node_1 (currently = camera yaw by assumption): see `mount_yaw_sweep.png` once produced.
+1. **Vayyar element layout.** The direct-coupling energy over the 20×20 Tx×Rx grid is smooth (so the 400 pairs are a 20×20 grid) but does not follow a uniform-pitch L-array: the Tx elements sit in two sub-groups (`mount_yaw_sweep.png`, `octonet_mount_yaw.py`). The azimuth/RA axis in `vayyar_radar_config` is therefore unverified; obtain the IMAGEVK-74 element coordinates (vSDK / datasheet in the old NBS `pdfs/IMAGEVK-74.pdf`) before any RA-based loss. Until then, fit SFCW on the pair-wise range profiles only (`kind='logmag'`).
+1b. Radar/UWB mount yaw on node_1: **unmeasurable** from the static returns. The SFCW loss vs yaw is a flat basin from about −100° to +120° around the camera yaw (it only rises when the radar faces the wall behind it); the UWB prototype curve has no peak above z = 3. Both keep the camera yaw, level, recorded as an assumption in `extrinsics.json`. Also exposed: `render_sfcw_pairs` has no antenna element pattern (a cos^p pattern was assumed for the sweep).
 2. SFCW drift: the per-recording temporal mean is biased by up to a few dB at 1.2–2.5 m by thermal drift; a per-pair gain/phase ramp model would raise the usable SNR there.
 3. UWB head (pulse PSF) and a real UWB frame stream (only one frame per recording was found — check other recordings / the raw HF files).
 4. WiFi: HT40 null/pilot mask before any loss; Tx/Rx positions need measuring.
