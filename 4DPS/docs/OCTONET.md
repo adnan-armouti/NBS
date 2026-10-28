@@ -46,7 +46,7 @@ render is 20–30 dB too bright at 0.2–1 m and too dark beyond 2.5 m; the fit 
 within ~2 dB over 0.5–3.3 m, individual pairs follow the slow shape but not the pair-specific ripple. An unbounded rho
 reaches 0.588 by sending a few points to ~1000×: the per-point field is under-determined by one profile per pair.
 
-## Open items
+## Open items (plans: `docs/plans/2026-10-28_open_items.md`)
 1. Vayyar element layout (two Tx sub-groups): obtain the IMAGEVK-74 coordinates before any RA / azimuth term.
 2. rho < 1 near the radar may be compensating the coupling's Hann sidelobes leaking into bins 6–25: model the
    coupling in the target or widen the guard.
@@ -54,6 +54,6 @@ reaches 0.588 by sending a few points to ~1000×: the per-point field is under-d
    way to make it physical. A smoothness prior on rho is the cheap alternative to the bound.
 4. Person term for UWB / Wi-Fi: not built. Test detectability first (WRITE_UP #19 repeated on UWB/WiFi); the SMPL
    sequence and `person_sequence.npz` are ready for it.
-5. Radar/UWB mount yaw = camera yaw by assumption; UWB band constants from the datasheet; one UWB frame per pickle.
+5. Radar/UWB mount yaw = camera yaw by assumption; UWB band constants from the datasheet (the pulse template can be read from the data's coupling peak). The UWB pickle is a 17 Hz stream (fixed 2026-10-28: `octonet_io.load_uwb`); the heads' `cir_rf` output is the comparable one (RF-sampled frames).
 6. `octonet_fit` reads paths under `$NBS_DATA_OUT`; a `Workspace`-style layout can replace that when the chain is
    needed. The 4DPS `chain.py` (HuPR/RT-Pose stage orchestration, GVHMR, Depth-Anything) is NOT used for OctoNet.

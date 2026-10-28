@@ -146,8 +146,7 @@ def sfcw_metrics(rp_r: torch.Tensor, target: dict, ra_ok: bool) -> dict:
 
 # --------------------------------------------------------------------------- UWB prototype
 def uwb_gt():
-    x = pickle.load(open(S.modality_path(1, "uwb", S.REC_SIT), "rb"))
-    frames = np.stack([np.asarray(e["frame"], float) for e in x]) if isinstance(x, list) else np.asarray(x["frame"], float)[None]
+    frames, _t = IO.load_uwb(S.modality_path(1, "uwb", S.REC_SIT))     # 17 Hz stream (the pickle holds one dict per frame)
     mag = np.abs(frames).mean(0); nb = len(mag); r = np.arange(nb) * S.UWB["max_range_m"] / S.UWB["n_bins"]
     return mag, r
 

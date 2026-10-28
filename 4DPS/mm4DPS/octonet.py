@@ -45,8 +45,8 @@ class Sensor:
 SENSORS = {
     "vayyar": Sensor("vayyar", "sfcw", 1, 65.0e9, 4.0e9, 100, 3.1, "calib_S1/extrinsics.json: vayyar (node_1 marker + camera yaw)",
                      "20x20 L-array, pair order tx-major, Tx layout UNVERIFIED (two sub-groups); pair-wise range profiles only"),
-    "uwb": Sensor("uwb", "uwb", 1, 8.75e9, 2.5e9, 1535, 17.07, "calib_S1/extrinsics.json: uwb (= node_1 marker + camera yaw)",
-                  "Novelda X4M200, single Tx/Rx, real baseband CIR, 9.9 m / 1535 bins; ONE frame per recording pickle"),
+    "uwb": Sensor("uwb", "uwb", 1, 7.2e9, 1.5e9, 1535, 17.06, "calib_S1/extrinsics.json: uwb (= node_1 marker + camera yaw)",
+                  "Novelda X4M200, single Tx/Rx, RF-sampled frame (23.328 GS/s, carrier ~7.2 GHz), 9.9 m / 1535 bins, 17.06 Hz stream (pickle = one dict per frame)"),
     "wifi": Sensor("wifi", "wifi", 0, 5.18e9, 40.0e6, 114, 75.6, "octonet_scene.WIFI_TX_APPROX / WIFI_RX_APPROX (schematic, +-0.5 m)",
                    "Xiaomi AX6000 Tx (1 ant) -> 4x RPi CM4 + AX200 Rx (2 ant), ch 36 HT40; receiver k under node_k/wifi; Rx-4 NLOS"),
 }
@@ -85,13 +85,8 @@ class OctoNetSequence:
         return IO.load_vayyar(self.path(1, "vayyar"))
 
     def uwb(self):
-        """(F,1535) float CIR frames (F=1 in the released pickles), (F,) epoch s."""
-        import pickle, datetime as dt
-        x = pickle.load(open(self.path(1, "uwb"), "rb"))
-        entries = x if isinstance(x, list) else [x]
-        frames = np.stack([np.asarray(e["frame"], dtype=np.float64) for e in entries])
-        t = np.array([e["timestamp"].timestamp() if hasattr(e["timestamp"], "timestamp") else float(e["timestamp"]) for e in entries])
-        return frames, t
+        """(F,1535) float64 RF-sampled CIR frames at 17.07 Hz (the pickle is a stream of per-frame dicts), (F,) epoch s."""
+        return IO.load_uwb(self.path(1, "uwb"))
 
     def wifi(self, receiver: int):
         """(F,2,114) complex CSI of receiver k (stored under node_k/wifi), (F,) epoch s."""

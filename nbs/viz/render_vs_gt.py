@@ -130,8 +130,7 @@ def sfcw():
 
 # ----------------------------------------------------------------------------- UWB
 def uwb(pcl):
-    x = pickle.load(open(S.modality_path(1, "uwb", REC), "rb"))
-    frames = np.stack([np.asarray(e["frame"], float) for e in x]) if isinstance(x, list) else np.asarray(x["frame"], float)[None]
+    frames, _t_uwb = IO.load_uwb(S.modality_path(1, "uwb", REC))     # the pickle is a STREAM of per-frame dicts (17 Hz)
     nb = frames.shape[1]; r = np.arange(nb) * S.UWB["max_range_m"] / S.UWB["n_bins"]
     mag = np.abs(frames)
     # prototype pulse-sum render (monostatic at node_1), incoherent envelope
@@ -146,7 +145,7 @@ def uwb(pcl):
     if len(frames) > 1: a.plot(r, db(mag.mean(0)), lw=1.2, label="temporal mean")
     a.axvline(SUBJECT_R, color="r", ls="--", lw=1, label=f"subject spot {SUBJECT_R:.2f} m"); a.set_ylim(DB_FLOOR, 1)
     a.set_xlabel(f"range (m), bin {S.UWB['bin_m']*100:.2f} cm, {nb} bins"); a.set_ylabel("|CIR| (dB rel. max)")
-    a.set_title(f"GT UWB CIR (X4M200, node_1) — {len(frames)} frame(s) in this pickle"); a.legend(); a.grid(alpha=.3)
+    a.set_title(f"GT UWB CIR (X4M200, node_1) — {len(frames)} frames at 17 Hz (RF-sampled, carrier ~7.2 GHz)"); a.legend(); a.grid(alpha=.3)
     k = 1
     if len(frames) > 1:
         a = ax[1]; im = a.imshow(db(mag), aspect="auto", origin="lower", extent=[r[0], r[-1], 0, len(mag)], cmap="magma", vmin=DB_FLOOR, vmax=0)
@@ -157,7 +156,7 @@ def uwb(pcl):
     fig.suptitle(f"UWB — recording {REC} — radar pose = node_1 rigid body + node_1 camera yaw ({POSE})", fontsize=12)
     fig.tight_layout(); fig.savefig(os.path.join(OUT, "uwb_gt_vs_rendered.png"), dpi=160); plt.close(fig)
     pk = r[np.argmax(mag.mean(0)[20:]) + 20]
-    CAP.append(f"uwb_gt_vs_rendered.png: pickle holds {len(frames)} frame(s) x {nb} bins (paper Tab. 2: 1x1535, 17 Hz — the per-recording pickle apparently stores one frame). GT peak (beyond bin 20) at {pk:.2f} m. Rendered is a PROTOTYPE incoherent pulse-sum, not a 4DPS head; UWB radar position/orientation assumed = node_1.")
+    CAP.append(f"uwb_gt_vs_rendered.png: {len(frames)} frames x {nb} bins at 17.06 Hz (the pickle is a stream of appended per-frame dicts; an earlier read took only the first). The frame is RF-sampled at 23.328 GS/s (spectral peak 7.2 GHz), bin 6.43 mm. GT peak (beyond bin 20) at {pk:.2f} m. Rendered is a PROTOTYPE incoherent pulse-sum, not a 4DPS head; UWB radar position/orientation assumed = node_1.")
 
 # ----------------------------------------------------------------------------- WiFi
 def wifi(pcl):

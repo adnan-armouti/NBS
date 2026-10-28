@@ -177,3 +177,28 @@ def clip_key(path):
     """``<timestamp>_node_1_..._subject_N_activity_A_trial_K`` -> that stem (join key across
     modalities).  Works for any OctoNet per-clip filename."""
     return os.path.splitext(os.path.basename(path))[0]
+
+
+def load_pickle_stream(path):
+    """Every object in a pickle file that was written by repeated ``pickle.dump`` calls (OctoNet's UWB files:
+    one dict per frame appended; ``pickle.load`` alone returns only the first frame). Mirrors OctoNet's
+    ``load_data_from_pickle``."""
+    import pickle
+    out = []
+    with open(path, "rb") as fh:
+        while True:
+            try:
+                out.append(pickle.load(fh))
+            except EOFError:
+                break
+    return out
+
+
+def load_uwb(path):
+    """One UWB recording: ``(frames (F,1535) float64, t (F,) epoch s)``. F ~ 1500-1700 at 17.07 Hz.
+    The frame is the RF-sampled X4 waveform (23.328 GS/s, carrier ~7.2 GHz), bin = c / (2 fs) = 6.43 mm."""
+    entries = load_pickle_stream(path)
+    if len(entries) == 1 and isinstance(entries[0], list):
+        entries = entries[0]
+    frames = np.stack([np.asarray(e["frame"], dtype=np.float64) for e in entries])
+    return frames, to_epoch([e["timestamp"] for e in entries])

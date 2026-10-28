@@ -61,13 +61,17 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
   (nominal D455 87°×58°). Per-node clip stamps differ by ~1 s: resolve paths via `cut_manual.csv`
   (`octonet_scene.modality_path`).
-- UWB (Novelda X4M200, node_1): pickle dict `{frame: 1535 floats, timestamp}`, 2.5 GHz BW, 9.9 m max.
+- UWB (Novelda X4M200, node_1): the pickle is a **stream** of per-frame dicts `{frame: 1535 floats, timestamp}` —
+  use `octonet_io.load_uwb` (plain `pickle.load` returns only the first frame): ~1576 frames at 17.06 Hz per recording.
+  The frame is RF-sampled (23.328 GS/s, carrier ~7.2 GHz), bin 6.43 mm, 9.9 m; static-dominated (residual −31 dB).
   WiFi: per receiver k (stored under `node_k/wifi`) dict `{timestamp: list(F), data: (F,2,114) complex}`,
   ch 36 / 5.18 GHz / 40 MHz, Rx-4 NLOS behind a 3 cm board.
-- **Vayyar array layout is unverified**: the direct-coupling structure shows the 20 Tx in two sub-groups, not the
-  uniform-pitch line assumed in `vayyar_radar_config`. No RA/azimuth-based loss until the real IMAGEVK-74 element
-  coordinates are in; fit on pair-wise range profiles (`sfcw_target`, `kind='logmag'`). Radar/UWB mount yaw on
-  node_1 = camera yaw by assumption (sweep was flat, `octonet_mount_yaw.py`).
+- **Vayyar array**: datasheet L-array (Tx1..20 on one edge, Rx21..40 on the adjacent edge, corner Tx20/Rx21 = tx 19 /
+  rx 0 in the tx-major reshape, D = 0.04 m per edge), consistent with the strongest coupling pairs. But the raw phasors
+  carry uncalibrated per-element phases (range-independent +90..105°/element ramp along the first pair axis, random
+  along the second), so **no RA/azimuth processing or complex loss until the per-channel phase calibration of
+  `docs/plans/2026-10-28_open_items.md` §4 is done**; fit on pair-wise range profiles (`sfcw_target`, `kind='logmag'`).
+  Radar/UWB mount yaw on node_1 = camera yaw by assumption (range-only sweep was flat; redo with RA after calibration).
 - OctoNet's own loader code: GitHub `aiot-lab/OctoNet` (`dataset_loader.py`).
 
 ## OctoNet in the 4DPS copy (Task B, done 2026-10-27)
@@ -76,6 +80,10 @@ entries: `python -m mm4DPS.reconstruction scaffold --dataset octonet --rec <rec>
 `… person-sequence --dataset octonet --sequence <rec> --output-dir <dir>`; sequence access `mm4DPS.octonet.OctoNetSequence`;
 heads `mm4DPS/octonet_heads.py` (`selftest`); static fit `python -m mm4DPS.octonet_fit fit-static`. Contracts, results and
 open items: `4DPS/docs/OCTONET.md`. The 4DPS `chain.py` is not used for OctoNet.
+
+## Plans
+`docs/plans/2026-10-28_open_items.md`: material identifiability + what to take from Hofmann, coupling removal, person
+detectability test, Vayyar assumptions V1–V10 (awaiting line-item approval), mount yaw, UWB template.
 
 ## Key docs
 `docs/node_migration_plan.md` (how the node is set up), `docs/prompts/viz_octonet_prompt.md`,
