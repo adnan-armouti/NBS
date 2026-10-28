@@ -198,7 +198,7 @@ def main():
     print(f"single {os.path.basename(p)}: {tg['summary']}")
     save_target(tg, os.path.join(out_dir, "target_rec_sit.npz"), dict(recording=os.path.basename(p)))
     recs = pick_scene1_recordings(5)
-    pool = pool_recordings(recs)
+    pool = pool_recordings(recs, coupling="tone2")          # default pool: two-tone on-board coupling removed (T4, 2026-10-28)
     print("pool recordings:", [os.path.basename(r).split("_activity_")[1].split("_trial")[0] for r in recs])
     print(f"pool: {pool['summary']}")
     for tg_i, nm in zip(pool["per_rec"], pool["names"]):

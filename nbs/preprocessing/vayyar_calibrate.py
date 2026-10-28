@@ -31,7 +31,9 @@ COUPLING_BINS = slice(0, 14)
 
 # --------------------------------------------------------------------------- basics
 def load(rec):
-    V, t = IO.load_vayyar(S.modality_path(1, "vayyar", rec))
+    """``rec`` = 14-digit recording stamp or a direct path to a vayyar pickle (pick_scene1_recordings returns paths)."""
+    path = rec if os.path.sep in str(rec) else S.modality_path(1, "vayyar", rec)
+    V, t = IO.load_vayyar(path)
     return V.astype(np.complex128), t
 
 
@@ -202,9 +204,12 @@ def scaffold_occupancy(theta_deg, n_bins=NF, yaw_shift_deg=0.0):
     return gaussian_filter(occ, (1.0, 2.0))
 
 
-def measured_ra(rp400, az_axis, corner_az, pitch, theta_deg, order="AB"):
-    """|RA| (bins, theta): DFT across the azimuth edge's 20 elements with explicit positions, incoherent sum over the other edge."""
+def measured_ra(rp400, az_axis, corner_az, pitch, theta_deg, order="AB", ramp_A_deg=0.0):
+    """|RA| (bins, theta): DFT across the azimuth edge's 20 elements with explicit positions, incoherent sum over the other edge.
+    ``ramp_A_deg``: a per-element linear phase removed along the A axis before beamforming (the deterministic ramp)."""
     Mb = np.stack([mat(rp400[:, b], order) for b in range(NF)])             # (100, A, B)
+    if ramp_A_deg:
+        Mb = Mb * np.exp(-1j * np.radians(ramp_A_deg) * np.arange(20))[None, :, None]
     if az_axis == "B":
         Mb = Mb.transpose(0, 2, 1)                                           # (100, az, other)
     xi = np.abs(np.arange(20) - corner_az) * pitch                            # positions along the az edge
@@ -214,20 +219,33 @@ def measured_ra(rp400, az_axis, corner_az, pitch, theta_deg, order="AB"):
 
 
 def score(ra, occ):
+    """Pearson correlation of the azimuth structure (per-range-bin mean removed) of two dB images on the guarded bins."""
     def prep(X):
-        Y = 20 * np.log10(np.clip(X, 1e-12, None)); Y = Y[GUARD]
+        X = np.asarray(X, float); Y = 10 * np.log10(np.clip(X, 1e-3 * X.max(), None)); Y = Y[GUARD]
         Y = Y - Y.mean(1, keepdims=True); return Y.ravel()
     a, b = prep(ra), prep(occ)
+    if a.std() < 1e-9 or b.std() < 1e-9: return 0.0
     return float(np.corrcoef(a, b)[0, 1])
+
+
+def coupling_peak_range(rp400):
+    """Sub-bin range (m) of the coupling peak per pair (parabolic interpolation of |rp| in bins 2..12)."""
+    a = np.abs(rp400[:, 2:13]); k = a.argmax(1) + 2; out = []
+    for p in range(rp400.shape[0]):
+        y0, y1, y2 = np.abs(rp400[p, k[p] - 1]), np.abs(rp400[p, k[p]]), np.abs(rp400[p, k[p] + 1])
+        den = (y0 - 2 * y1 + y2); d = 0.5 * (y0 - y2) / den if abs(den) > 1e-12 else 0.0
+        out.append((k[p] + d) * BIN_M)
+    return np.array(out)
 
 
 # --------------------------------------------------------------------------- 3. range offset
 def range_offset_from_profiles(rp_meas, pcl_render_profile):
     pm = 20 * np.log10(np.abs(rp_meas).mean(0) + 1e-12); pr = 20 * np.log10(pcl_render_profile + 1e-12)
-    pm[~GUARD] = np.nan; pr[~GUARD] = np.nan
+    band = GUARD & (np.arange(NF) * BIN_M > 0.5) & (np.arange(NF) * BIN_M < 2.6)
+    pm[~band] = np.nan; pr[~band] = np.nan
     best = None
-    for lag in range(-12, 13):
-        a = np.roll(pm, -lag); ok = np.isfinite(a) & np.isfinite(pr) & GUARD
+    for lag in range(-6, 7):
+        a = np.roll(pm, -lag); ok = np.isfinite(a) & np.isfinite(pr) & band
         c = np.corrcoef(a[ok], pr[ok])[0, 1]
         if best is None or c > best[1]: best = (lag, c)
     return dict(lag_bins=best[0], lag_m=best[0] * BIN_M, corr=best[1])
@@ -252,10 +270,12 @@ def render_profile(az_axis, corner_A, corner_B, pitch, device="cuda"):
 def main():
     t0 = time.time()
     from method.sfcw_target import pick_scene1_recordings
-    recs = pick_scene1_recordings(3)
+    paths = pick_scene1_recordings(3)                                     # vayyar pickle paths (their stamps differ from node_1's by ~1 s)
+    labels = [os.path.basename(str(x))[:14] for x in paths]
     out_dir = os.path.join(C.NBS_DATA_OUT, "calib_S1"); viz_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "viz", "render_vs_gt")
-    res = {"recordings": recs, "pitch_assumed_mm": 2.1, "lambda_mm": LAM * 1e3}
-    Vs = {r: load(r)[0] for r in recs}
+    recs = labels
+    res = {"recordings": recs, "vayyar_files": [os.path.basename(str(x)) for x in paths], "pitch_assumed_mm": 2.1, "lambda_mm": LAM * 1e3}
+    Vs = {lab: load(pth)[0] for lab, pth in zip(labels, paths)}
     # ---- 1d ramp + baseline coherence
     res["ramp"] = {r: ramp_test(Vs[r]) for r in recs}
     # ---- 1b per-sweep phase test
@@ -281,19 +301,55 @@ def main():
     # ---- 2. RA vs occupancy over candidates (calibrated static, coupling bins guarded)
     theta = np.linspace(-80, 80, 81)
     occ = scaffold_occupancy(theta)
-    rng = np.random.default_rng(1); null = [scaffold_occupancy(theta, yaw_shift_deg=float(d)) for d in rng.uniform(25, 335, 16)]
+    rng = np.random.default_rng(1)
+    null = [np.roll(occ[:, ::(1 if f < 0.5 else -1)], int(k), axis=1) for k, f in zip(rng.integers(12, 70, 24), rng.uniform(size=24))]
     table = []
-    for order in ("AB",):
-        for az_axis in ("A", "B"):
-            for corner_az in (0, 19):
-                for pitch_mm in (1.6, 1.8, 2.0, 2.1, 2.2, 2.4, 2.6):
-                    for which in ("calibrated", "raw"):
-                        rp = rp1 if which == "calibrated" else rp0
-                        ra = measured_ra(rp, az_axis, corner_az, pitch_mm * 1e-3, theta)
-                        sc = score(ra, occ); nulls = [score(ra, o) for o in null]
-                        table.append(dict(az_axis=az_axis, corner_az=corner_az, pitch_mm=pitch_mm, data=which, score=sc, null_mean=float(np.mean(nulls)), null_std=float(np.std(nulls)), z=float((sc - np.mean(nulls)) / (np.std(nulls) + 1e-9))))
-    table.sort(key=lambda r: -r["score"]); res["ra_scores"] = table[:40]; res["ra_scores_all"] = table
+    ramp0 = float(np.mean([res["ramp"][recs[0]]["per_bin"][b]["slope0_deg"] for b in (20, 27, 40, 80, 92)]))
+    res["ramp_A_deg_mean"] = ramp0
+    for az_axis in ("A", "B"):
+        for corner_az in (0, 19):
+            for pitch_mm in (1.6, 1.8, 2.0, 2.1, 2.2, 2.4, 2.6):
+                for ramp_tag, ramp in (("raw", 0.0), ("A-ramp removed", ramp0)):
+                    ra = measured_ra(rp0, az_axis, corner_az, pitch_mm * 1e-3, theta, ramp_A_deg=ramp)
+                    sc = score(ra, occ); nulls = [score(ra, o) for o in null]
+                    table.append(dict(az_axis=az_axis, corner_az=corner_az, pitch_mm=pitch_mm, data=ramp_tag, score=sc, null_mean=float(np.mean(nulls)), null_std=float(np.std(nulls)), z=float((sc - np.mean(nulls)) / (np.std(nulls) + 1e-9))))
+    # joint (pitch x removed-ramp) grid for azimuth along A, both corners: a ramp is an azimuth shift whose angle depends on the pitch
+    pitches = np.arange(1.4, 2.81, 0.2); ramps = np.arange(-180, 181, 10); grid = {}
+    for corner_az in (0, 19):
+        Gs = np.zeros((len(pitches), len(ramps)))
+        for a, pm in enumerate(pitches):
+            for r_, rm in enumerate(ramps):
+                Gs[a, r_] = score(measured_ra(rp0, "A", corner_az, pm * 1e-3, theta, ramp_A_deg=float(rm)), occ)
+        grid[corner_az] = Gs
+    res["grid_pitches_mm"] = pitches.tolist(); res["grid_ramps_deg"] = ramps.tolist(); res["grid_scores"] = {str(k): v.tolist() for k, v in grid.items()}
+    kbest = max(grid, key=lambda k: grid[k].max()); ia, ir = np.unravel_index(grid[kbest].argmax(), grid[kbest].shape)
+    ra_best = measured_ra(rp0, "A", kbest, pitches[ia] * 1e-3, theta, ramp_A_deg=float(ramps[ir]))
+    nb = [score(ra_best, o) for o in null]
+    res["joint_best"] = dict(az_axis="A", corner_az=int(kbest), pitch_mm=float(pitches[ia]), ramp_A_deg=float(ramps[ir]), score=float(grid[kbest].max()), null_mean=float(np.mean(nb)), null_std=float(np.std(nb)), z=float((grid[kbest].max() - np.mean(nb)) / (np.std(nb) + 1e-9)))
+    sweep = [dict(ramp_A_deg=float(rm), score=float(grid[kbest][ia, r_])) for r_, rm in enumerate(ramps)]
+    res["ramp_sweep_at_best_geometry"] = sweep
+    table.sort(key=lambda r: -r["score"])
+    res["coupling_peak_range_m"] = dict(median=float(np.median(coupling_peak_range(rp0))), p5=float(np.percentile(coupling_peak_range(rp0), 5)), p95=float(np.percentile(coupling_peak_range(rp0), 95)))
+    res["ra_scores"] = table[:40]; res["ra_scores_all"] = table
     bestra = table[0]
+    # ---- 2b. render-based scoring of the leading candidates (same PSF and RA transform on both sides)
+    rb = []
+    try:
+        cache = {}
+        for corner_az in (19, 0):
+            for pm in (1.6, 2.1, 2.6):
+                key = (corner_az, pm)
+                Hr = render_profile("A", corner_az, 0 if corner_az == 19 else 19, pm * 1e-3); cache[key] = rc(Hr)
+                ra_rend = measured_ra(cache[key], "A", corner_az, pm * 1e-3, theta)
+                nullr = [np.roll(ra_rend[:, ::(1 if f < 0.5 else -1)], int(k), axis=1) for k, f in zip(rng.integers(8, 60, 24), rng.uniform(size=24))]
+                for ramp in (0.0, ramp0, float(res["joint_best"]["ramp_A_deg"])):
+                    ra_m = measured_ra(rp0, "A", corner_az, pm * 1e-3, theta, ramp_A_deg=ramp)
+                    sc = score(ra_m, ra_rend); nn = [score(ra_m, o) for o in nullr]
+                    rb.append(dict(corner_az=corner_az, pitch_mm=pm, ramp_A_deg=ramp, score=sc, null_mean=float(np.mean(nn)), null_std=float(np.std(nn)), z=float((sc - np.mean(nn)) / (np.std(nn) + 1e-9))))
+        rb.sort(key=lambda r: -r["score"]); res["render_based_scores"] = rb
+        print("render-based top:"); [print("  ", r) for r in rb[:6]]
+    except Exception as e:
+        res["render_based_scores"] = {"error": repr(e)}; print("render-based scoring failed:", e)
     # ---- 3. range offset from profiles (render under the best candidate)
     try:
         Hr = render_profile(bestra["az_axis"], cA if bestra["az_axis"] == "A" else cA, cB, p_eff)
@@ -305,13 +361,16 @@ def main():
     # ---- verdicts
     cf = res["coupling_fit"][recs[0]]
     v = []
-    v.append(f"V3 corner: coupling-path non-additive structure best explained by corner A={cA}, B={cB} (corr {cf[0]['corr']:.2f} vs next {cf[1]['corr']:.2f}).")
-    v.append(f"V2 pitch: effective pitch from the coupling path {p_eff*1e3:.2f} mm (includes any on-board propagation slowdown); RA-vs-scaffold best pitch {bestra['pitch_mm']} mm (z {bestra['z']:.1f}).")
+    v.append(f"Coupling as a geometry probe: the non-additive part of the per-pair coupling delays is NOT explained by an L-array (best corr {cf[0]['corr']:.2f}, implied pitch {cf[0]['pitch_eff_mm']:.1f} mm, corner ambiguous): the on-board coupling is not a single free-space path, so a coupling-based per-channel delay calibration is rejected (applying it lowered the scene coherence).")
+    jb = res["joint_best"]
+    v.append(f"V2 pitch: the joint (pitch x ramp) RA-vs-scaffold grid peaks at pitch {jb['pitch_mm']:.1f} mm with a removed A-ramp of {jb['ramp_A_deg']:+.0f} deg/element (score {jb['score']:.3f}, z {jb['z']:.1f} vs azimuth-rolled nulls); pitch and ramp trade off (a ramp = an azimuth shift), so the pitch alone is NOT pinned by this test; the coupling-path pitch estimate ({p_eff*1e3:.1f} mm) is physically meaningless (see above).")
     v.append(f"V4 order/azimuth axis: RA correlation best with azimuth along axis {bestra['az_axis']} (corner index {bestra['corner_az']}), score {bestra['score']:.3f}, z {bestra['z']:.1f}; runner-up on the other axis: " + str(next((f"{r['score']:.3f} (z {r['z']:.1f})" for r in table if r['az_axis'] != bestra['az_axis']), 'n/a')))
     ps = res["per_sweep"][recs[0]]
-    v.append(f"V6 phases: per-channel electrical delays A rms {np.std(cal['delay_A_m'])*1e3:.1f} mm, B rms {np.std(cal['delay_B_m'])*1e3:.1f} mm; rank-1 phase fit {cal['phase_rank1_fit']:.2f}; per-sweep test axis0 similarity {ps['axis0']['frame_similarity_before']:.2f}->{ps['axis0']['frame_similarity_after_removing_phase']:.2f} (consistency {ps['axis0']['within_frame_phase_consistency']:.2f}), axis1 {ps['axis1']['frame_similarity_before']:.2f}->{ps['axis1']['frame_similarity_after_removing_phase']:.2f} (consistency {ps['axis1']['within_frame_phase_consistency']:.2f}).")
+    sw = max(res["ramp_sweep_at_best_geometry"], key=lambda r: r["score"])
+    v.append(f"V6 phases: a deterministic +{ramp0:.0f} deg/element phase ramp along axis A at every range and frame (per-frame std {res['ramp'][recs[0]]['per_frame_bin27']['slope0_std']:.1f} deg); RA-vs-scaffold score vs removed ramp peaks at {sw['ramp_A_deg']:+.0f} deg/element (score {sw['score']:.3f}; raw 0 deg: {next(r['score'] for r in res['ramp_sweep_at_best_geometry'] if r['ramp_A_deg']==0):.3f}); per-sweep test axis0 similarity {ps['axis0']['frame_similarity_before']:.2f}->{ps['axis0']['frame_similarity_after_removing_phase']:.2f} (consistency {ps['axis0']['within_frame_phase_consistency']:.2f}), axis1 {ps['axis1']['frame_similarity_before']:.2f}->{ps['axis1']['frame_similarity_after_removing_phase']:.2f} (consistency {ps['axis1']['within_frame_phase_consistency']:.2f}).")
     ro = res.get("range_offset_from_profiles", {})
-    v.append(f"V10 range offset: common electrical delay from the coupling = {cal['delay_common_m']*1e2:.1f} cm one-way path (range offset {cal['delay_common_m']/2*1e2:.1f} cm); profile cross-correlation lag vs render {ro.get('lag_m', float('nan'))*1e2 if 'lag_m' in ro else float('nan'):.1f} cm (corr {ro.get('corr', float('nan')):.2f}).")
+    cp = res["coupling_peak_range_m"]
+    v.append(f"V10 range offset: the coupling peak sits at {cp['median']*1e2:.1f} cm range (p5-p95 {cp['p5']*1e2:.1f}-{cp['p95']*1e2:.1f}), i.e. an on-board electrical path, not a usable zero reference; profile cross-correlation lag vs the rendered scaffold in 0.5-2.6 m: {ro.get('lag_m', float('nan'))*1e2 if 'lag_m' in ro else float('nan'):+.1f} cm (corr {ro.get('corr', float('nan')):.2f}).")
     res["verdict"] = v; res["runtime_s"] = time.time() - t0
     os.makedirs(out_dir, exist_ok=True)
     json.dump(res, open(os.path.join(out_dir, "vayyar_channel_calibration.json"), "w"), indent=1, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
@@ -347,18 +406,20 @@ def figure(res, rp0, rp1, occ, theta, prof_r, cal, viz_dir):
              f" axis1: {ps['axis1']['frame_similarity_before']:.2f} -> {ps['axis1']['frame_similarity_after_removing_phase']:.2f} (consist {ps['axis1']['within_frame_phase_consistency']:.2f})",
              "", "ramp slope0 per frame at bin 27: %.1f +- %.1f deg" % (res["ramp"][res["recordings"][0]]["per_frame_bin27"]["slope0_mean"], res["ramp"][res["recordings"][0]]["per_frame_bin27"]["slope0_std"])]
     ax.text(0, 1, "\n".join(rows), va="top", family="monospace", fontsize=9); ax.set_title("coherence along the pair axes, raw vs calibrated (mean channel)")
-    b = res["ra_scores"][0]
-    ra_c = measured_ra(rp1, b["az_axis"], b["corner_az"], b["pitch_mm"] * 1e-3, theta); ra_r = measured_ra(rp0, b["az_axis"], b["corner_az"], b["pitch_mm"] * 1e-3, theta)
+    b = res["joint_best"]
+    ra_c = measured_ra(rp0, "A", b["corner_az"], b["pitch_mm"] * 1e-3, theta, ramp_A_deg=b["ramp_A_deg"]); ra_r = measured_ra(rp0, "A", b["corner_az"], b["pitch_mm"] * 1e-3, theta)
     ext = [theta[0], theta[-1], 0, NF * BIN_M]
     def show(ax, X, title):
         Y = 20 * np.log10(np.clip(X, 1e-12, None)); Y[~GUARD] = np.nan; Y = Y - np.nanmax(Y)
         ax.imshow(Y, origin="lower", aspect="auto", extent=ext, vmin=-40, vmax=0, cmap="viridis"); ax.set_title(title, fontsize=9); ax.set_xlabel("azimuth (deg)"); ax.set_ylabel("range (m)")
-    show(axs[1, 1], ra_r, f"measured static |RA|, RAW, best candidate (az axis {b['az_axis']}, corner {b['corner_az']}, pitch {b['pitch_mm']} mm)")
-    show(axs[1, 2], ra_c, f"measured static |RA|, CALIBRATED; score {b['score']:.3f}, z {b['z']:.1f}")
+    show(axs[1, 1], ra_r, f"measured static |RA|, raw phases (az = A, corner {b['corner_az']}, pitch {b['pitch_mm']:.1f} mm)")
+    show(axs[1, 2], ra_c, f"measured static |RA| with the A-ramp {b['ramp_A_deg']:+.0f} deg/element removed; score {b['score']:.3f}, z {b['z']:.1f}")
     show(axs[2, 0], occ + 1e-9, "scaffold occupancy (range, azimuth), 1/r^2 weighted, smoothed")
-    ax = axs[2, 1]; ax.axis("off")
-    rows = ["az  corner pitch  data        score   z"] + [f"{r['az_axis']}   {r['corner_az']:2d}    {r['pitch_mm']:.1f}  {r['data']:10s} {r['score']:+.3f} {r['z']:+5.1f}" for r in res["ra_scores"][:22]]
-    ax.text(0, 1, "\n".join(rows), va="top", family="monospace", fontsize=8.5); ax.set_title("RA-vs-occupancy scores (top 22 of all candidates)")
+    ax = axs[2, 1]; jb = res["joint_best"]; G = np.array(res["grid_scores"][str(jb["corner_az"])])
+    im = ax.imshow(G, origin="lower", aspect="auto", extent=[res["grid_ramps_deg"][0], res["grid_ramps_deg"][-1], res["grid_pitches_mm"][0], res["grid_pitches_mm"][-1]], cmap="magma"); plt.colorbar(im, ax=ax, label="score")
+    ax.plot(jb["ramp_A_deg"], jb["pitch_mm"], "c*", ms=14); ax.axvline(res["ramp_A_deg_mean"], color="w", ls="--", lw=1)
+    ax.set_xlabel("removed phase ramp along A (deg/element); dashed = measured ramp"); ax.set_ylabel("pitch (mm)")
+    ax.set_title(f"RA-vs-scaffold score, azimuth = A, corner {jb['corner_az']}: best pitch {jb['pitch_mm']:.1f} mm, ramp {jb['ramp_A_deg']:+.0f} deg (score {jb['score']:.3f}, z {jb['z']:.1f})\nB-axis best: " + str(round(max((r['score'] for r in res['ra_scores_all'] if r['az_axis']=='B'), default=float('nan')), 3)), fontsize=9)
     ax = axs[2, 2]
     pm = 20 * np.log10(np.abs(rp0).mean(0) + 1e-12); pm[~GUARD] = np.nan; r = np.arange(NF) * BIN_M
     ax.plot(r, pm - np.nanmax(pm), label="measured static (raw)")

@@ -33,10 +33,15 @@ EXTRINSICS = os.environ.get("OCTONET_EXTRINSICS", os.path.join(DATA_OUT, "calib_
 VIZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "viz", "render_vs_gt")
 
 
-def load_target(path: str, device) -> dict:
+GUARD_LO = int(os.environ.get("OCTONET_SFCW_GUARD_LO", 24))   # bins < 24 (0.9 m) are the node's own near-field return, absent from the scaffold (T4)
+
+
+def load_target(path: str, device, guard_lo: int | None = None) -> dict:
     z = np.load(path)
     t = {k: torch.as_tensor(z[k]) for k in z.files}
     t["rp_mean"] = t["rp_mean"].to(torch.complex128).to(device); t["mask"] = t["mask"].bool().to(device)
+    g = GUARD_LO if guard_lo is None else guard_lo
+    if g: t["mask"][:g] = False
     for k in ("rel", "xcorr", "snr_db"):
         if k in t: t[k] = t[k].double().to(device)
     return t
@@ -157,6 +162,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("fit-static")
     s.add_argument("--scaffold-dir", default=None, help=f"scaffold stage dir (default {SCAFFOLD_DIR})")
+    s.add_argument("--guard-lo", type=int, default=GUARD_LO, help="mask range bins below this (default 24 = 0.9 m: the node's own near-field return)")
     s.add_argument("--points", type=int, default=30000); s.add_argument("--steps", type=int, default=300)
     s.add_argument("--lr", type=float, default=0.05); s.add_argument("--l2", type=float, default=0.1)
     s.add_argument("--chunk", type=int, default=4096); s.add_argument("--device", default="cuda")
@@ -164,6 +170,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "fit-static":
         if getattr(a, 'scaffold_dir', None): globals()['SCAFFOLD_DIR'] = a.scaffold_dir
+    globals()['GUARD_LO'] = a.guard_lo
     fit_static(a); return 0
 
 

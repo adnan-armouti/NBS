@@ -274,3 +274,39 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ----------------------------------------------------------------------------- post-hoc: drift-robust repetition check
+def spectral_check_detrended(t: np.ndarray, s: np.ndarray, f0: float, rng, n_perm=N_PERM):
+    """Like spectral_check, but on the series high-passed by a moving average of length 2/f0 (removes the thermal
+    drift that otherwise biases the permutation null: the raw check gave z ~ -2.3 for EVERY SFCW recording and
+    inflated UWB/WiFi), and scored as the peak at f0 relative to the local median over 0.5 f0 .. 2 f0."""
+    dt = np.median(np.diff(t)); n = len(s)
+    if f0 >= 0.5 / dt or n < 64: return None
+    w = max(3, int(round(2.0 / f0 / dt)) | 1); k = np.ones(w) / w
+    trend = np.convolve(np.pad(s, (w // 2, w // 2), mode="edge"), k, mode="valid")[:n]
+    x = s - trend
+    f = np.fft.rfftfreq(n, dt); band = np.abs(f - f0) < 0.06; loc = (f > 0.5 * f0) & (f < 2.0 * f0) & ~band
+    def pk(y):
+        y = y - y.mean(); P = np.abs(np.fft.rfft(y * np.hanning(n))) ** 2; return float(P[band].mean() / (np.median(P[loc]) + 1e-30))
+    obs = pk(x); null = np.array([pk(x[rng.permutation(n)]) for _ in range(n_perm)])
+    return {"obs_peak_ratio": obs, "z": float((obs - null.mean()) / (null.std() + 1e-12)), "p": float((null >= obs).mean()), "window_s": w * dt}
+
+
+def recheck_repetition():
+    rng = np.random.default_rng(0); S = json.load(open(os.path.join(OUT_DIR, "summary.json")))
+    for rec, e in S["recordings"].items():
+        for band, b in e["bands"].items():
+            p = os.path.join(OUT_DIR, f"{rec}_{band}.npz")
+            if not os.path.exists(p) or "scores" not in b: continue
+            z = np.load(p); b["repetition_raw"] = b.get("repetition_raw", b.get("repetition"))
+            b["repetition"] = spectral_check_detrended(z["t_full"], z["s_full"], e["f0_hz"], rng)
+    table = S["decision_table"]
+    for band in BANDS:
+        reps = [e["bands"][band]["repetition"]["z"] for e in S["recordings"].values() if band in e["bands"] and e["bands"][band].get("repetition") and e["f0_prominence"] > 3]
+        table[f"{band}/repetition"] = {"n_periodic": len(reps), "median_z": float(np.median(reps)) if reps else None, "frac_z_gt_3": float(np.mean(np.array(reps) > 3)) if reps else None, "note": "detrended (moving average 2/f0), peak/local-median at f0, permutation null"}
+    json.dump(S, open(os.path.join(OUT_DIR, "summary.json"), "w"), indent=1)
+    for band in BANDS:
+        print(band, "repetition (detrended):", {r: round(e["bands"][band]["repetition"]["z"], 1) for r, e in S["recordings"].items() if band in e["bands"] and e["bands"][band].get("repetition")})
+        print("   ", table[f"{band}/repetition"])
+    print("wifi LOS-blocked frames per receiver:", {e["activity"]: e["bands"]["wifi"].get("los_blocked_frames") for e in S["recordings"].values() if "wifi" in e["bands"]})

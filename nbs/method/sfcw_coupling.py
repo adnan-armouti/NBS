@@ -96,8 +96,8 @@ def _fit_one_tone(Hres: torch.Tensor, bins: torch.Tensor, tones: torch.Tensor):
     return A, bins.to(Hres.device)[idx]
 
 
-def fit_coupling(V, lo: float = 3.0, hi: float = 8.0, step: float = 0.02, n_tones: int = 2, iters: int = 3,
-                 second_halfwidth: float = 2.0, device: str | None = None, batch: int = 64) -> dict:
+def fit_coupling(V, lo: float = 0.0, hi: float = 6.0, step: float = 0.02, n_tones: int = 2, iters: int = 3,
+                 second_halfwidth: float = 3.0, device: str | None = None, batch: int = 64) -> dict:
     """Per frame & pair coupling tones in the un-windowed sweep. V (T,400,K) complex.
 
     Returns dict(V_clean (T,400,K) complex64 on CPU, coupling (T,400,K) complex64 = the fitted tones,
@@ -137,6 +137,19 @@ def fit_coupling(V, lo: float = 3.0, hi: float = 8.0, step: float = 0.02, n_tone
     e0 = (rp0[..., :6].abs() ** 2).sum(-1); e1 = (rp1[..., :6].abs() ** 2).sum(-1)
     return dict(V_clean=V_clean, coupling=coup, A=A_all, b=b_all, residual_db=(10 * torch.log10((e1 + EPS) / (e0 + EPS))),
                 grid=(lo, hi, step), n_tones=n_tones)
+
+
+def coupling_only_level_db(fit: dict, rp_measured_mean: torch.Tensor, window_kind: str = "hann") -> dict:
+    """Range-compress the fitted coupling alone (temporal mean) and report its level in bins 6-25 and 26-93
+    relative to the MEASURED guarded peak: the true window-leakage contribution of the coupling."""
+    c = range_compress(coupling_sweep_mean(fit)[None], window_kind)[0].abs() ** 2    # (400,K)
+    m = rp_measured_mean.abs() ** 2
+    g = m.mean(0)[6:94].max()
+    return dict(coupling_only_bins6_25_rel_peak_db=float(10 * torch.log10(c.mean(0)[6:26].mean() / (g + EPS))),
+                coupling_only_bins6_12_rel_peak_db=float(10 * torch.log10(c.mean(0)[6:13].mean() / (g + EPS))),
+                coupling_only_bins26_93_rel_peak_db=float(10 * torch.log10(c.mean(0)[26:94].mean() / (g + EPS))),
+                measured_bins6_25_rel_peak_db=float(10 * torch.log10(m.mean(0)[6:26].mean() / (g + EPS))),
+                coupling_peak_rel_scene_peak_db=float(10 * torch.log10(c.mean(0).max() / (g + EPS))))
 
 
 def coupling_sweep_mean(fit: dict) -> torch.Tensor:
@@ -235,6 +248,8 @@ def main():
         rp0 = RA.sfcw_range_compress(V.mean(0)); rp1 = RA.sfcw_range_compress(fit["V_clean"].mean(0))
         m0, m1 = leakage_metrics(rp0), leakage_metrics(rp1)
         res = float(fit["residual_db"].mean()); b0 = fit["b"][0]
+        lk = coupling_only_level_db(fit, rp0); report[f"sit_tone{nt}_leakage_only"] = lk
+        print(f"[{nt} tone] coupling alone (Hann) in bins 6-25: {lk['coupling_only_bins6_25_rel_peak_db']:+.1f} dB rel. scene peak (bins 6-12: {lk['coupling_only_bins6_12_rel_peak_db']:+.1f}); measured bins 6-25: {lk['measured_bins6_25_rel_peak_db']:+.1f} dB; coupling peak {lk['coupling_peak_rel_scene_peak_db']:+.1f} dB above the scene peak")
         print(f"[{nt} tone] fitted bin median {float(b0.median()):.2f} (p05 {float(b0.quantile(0.05)):.2f}, p95 {float(b0.quantile(0.95)):.2f}); "
               f"coupling energy left in bins 0-5: {res:+.1f} dB; bins 6-25 rel peak: {m0['bins6_25_mean_rel_peak_db']:+.1f} -> {m1['bins6_25_mean_rel_peak_db']:+.1f} dB; "
               f"near/far energy: {m0['near_over_far_db']:+.1f} -> {m1['near_over_far_db']:+.1f} dB")
@@ -265,16 +280,22 @@ def main():
     # ---- 4. decisive refits
     fits = {}
     cfgs = [("baseline_hann", "hann", None, "baseline_hann"), ("decoupled_hann", "hann", None, "decoupled_hann"),
-            ("decoupled_bh4", "bh4", None, "decoupled_bh4"), ("raw+coupling_in_render_hann_guard4", "hann", coup, None)]
+            ("decoupled_bh4", "bh4", None, "decoupled_bh4"), ("raw+coupling_in_render_hann_guard3", "hann", coup, "guard3"),
+            ("decoupled_hann_guard24", "hann", None, "guard24")]
     for name, win, cadd, tname in cfgs:
-        if tname is None:
-            tgp = ST.pool_recordings(recs, guard_lo=4); tgs = tgp["per_rec"][0]
+        if tname == "guard3":
+            tgp = ST.pool_recordings(recs, guard_lo=3); tgs = tgp["per_rec"][0]
+        elif tname == "guard24":
+            tgp = ST.pool_recordings(recs, guard_lo=24, coupling="tone2"); tgs = tgp["per_rec"][0]
         else:
             tgp, tgs = targets[tname]["pool"], targets[tname]["single"]
         r = refit(tgp, tgs, win=win, coupling_add=cadd, device=dev)
+        # comparable held metric: xcorr-weighted residual on bins 24-93 only (the scaffold-covered range), single recording
+        pb = torch.as_tensor(r["per_bin_after"]); w = tgp["xcorr"].clone().cpu(); w[:24] = 0; w[94:] = 0; w = torch.nan_to_num(w)
+        r["held_resid_bins24_93"] = float((torch.nan_to_num(pb) * w).sum() / (w.sum() + EPS))
         fits[name] = r
         print(f"fit {name:36s}: loss pool {r['loss_before']['pool']:.3f}->{r['loss_after']['pool']:.3f}, single {r['loss_before']['single']:.3f}->{r['loss_after']['single']:.3f} | "
-              f"rho median <1 m {r['rho_median_lt1m']:.3f}, 1-3.5 m {r['rho_median_1to3p5m']:.3f}, all {r['rho_median_all']:.3f} [{r['rho_p05']:.2f},{r['rho_p95']:.2f}] | {r['steps']} steps {r['seconds']:.0f} s")
+              f"rho median <1 m {r['rho_median_lt1m']:.3f}, 1-3.5 m {r['rho_median_1to3p5m']:.3f}, all {r['rho_median_all']:.3f} [{r['rho_p05']:.2f},{r['rho_p95']:.2f}] | held resid bins 24-93 {r['held_resid_bins24_93']:.3f} | {r['steps']} steps {r['seconds']:.0f} s")
         report[f"fit_{name}"] = {k: v for k, v in r.items() if k not in ("rho", "r_pt", "rp_before", "rp_after", "per_bin_after")}
     torch.save(dict(fits={k: dict(rho=v["rho"], r_pt=v["r_pt"], rp_before=v["rp_before"], rp_after=v["rp_after"], per_bin_after=v["per_bin_after"]) for k, v in fits.items()},
                     targets={k: dict(rp_mean=v["pool"]["rp_mean"], xcorr=v["pool"]["xcorr"], rel=v["pool"]["rel"], mask=v["pool"]["mask"]) for k, v in targets.items()},
