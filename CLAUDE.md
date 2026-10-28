@@ -65,6 +65,11 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   by per-packet carrier phase (coherence 0.01) → magnitude-only target, mask subcarriers [5,33,47,66,80,108]
   (`nbs/method/rf_static_targets.py`). UWB pulse template from the coupling peak: fc 7.0 GHz, −10 dB BW 1.46 GHz,
   FWHM 12.9 cm, on-board delay 4.5 cm (`nbs/method/uwb_template.py`); the paper's "2.5 GHz" is not what the data shows.
+- Multi-band material fit (`4DPS/mm4DPS/octonet_fit_multiband.py`, T11/T12): voxel-grid ITU `abcd` field, SFCW+UWB+WiFi
+  joint; the held-out-band gate gives only 2–3 % gains (SFCW 2σ, UWB marginal, WiFi fail) → **no band-synthesis claim
+  yet**. Known limits: WiFi Tx/Rx schematic (measure them), UWB pose assumed, ITU bounds saturate in the tails
+  (tighten d≤1.0, c≤0.1 S/m or use a class prior). Bounded per-point ρ (0.590) is not comparable to the ITU-bounded
+  grid (0.72–0.80): the former has ±26 dB of freedom, the latter ~12 dB.
 - Progress on all open items: `docs/plans/OPEN_ITEMS_TRACKER.md`.
 - RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
