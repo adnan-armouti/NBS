@@ -101,6 +101,24 @@ def metrics(band, rend, tnp):
     return {"sfcw": metrics_sfcw, "uwb": metrics_uwb, "wifi": metrics_wifi}[band](rend, tnp[band])
 
 
+
+NOTES = {
+ "sfcw": "SFCW alone: the fit flattens the uniform-concrete render (which was +10 dB too bright at 0.9 m and -7 dB too dark at 3.5 m) onto the GT pair-mean "
+         "profile within about +-2 dB over 0.9-2.6 m, reproducing the floor-ring dips at 1.5 / 2.0 / 2.2 m. It still under-predicts the rise of the GT beyond "
+         "2.6 m (GT +6 dB by 3.5 m, render flat: the far wall sits beyond the 3.71 m unambiguous range and wraps, and the subject spot at 2.9 m is a static "
+         "chair/person return the scaffold cuts), so the residual reaches -5 dB at 3.5 m. The per-pair image correlation stays low (0.27): the GT image has a strong "
+         "pair-wise banding (per-element gain differences across the 400 pairs) that the render cannot produce without a per-channel gain calibration, and the "
+         "per-pair ripple is below the scaffold's fidelity. Loose bounds reach 0.69 vs 0.72 by pushing sigma to 5 S/m on a few voxels.",
+ "uwb": "UWB alone: the trained envelope tracks the GT mean level over the whole 0.3-9.9 m span (iter 0 was +15 dB too bright below 1.5 m and -20 dB too dark at "
+        "6-7 m), and the 6.3-6.8 m far-wall cluster appears at the right range. The GT's fine structure (20-30 dB interference fades every few cm) is not "
+        "reproduced, so the correlation saturates near 0.5 and the RMSE at 6.7 dB: that structure needs the scaffold geometry to sub-cm accuracy and the UWB "
+        "mount pose, both of which are assumed (camera yaw, node marker). The near range (0.3-1.5 m) keeps a +5-10 dB excess: node body returns absent from the scaffold.",
+ "wifi": "WiFi alone: the trained |CSI| reproduces the broad spectral shape of every receiver and antenna (corr 0.87, RMSE 1.3 dB), including Rx-2's deep fade at "
+         "subcarrier ~35 on antenna 0 and the NLOS Rx-4 slope; residuals are within +-3 dB except Rx-1 antenna 1 above subcarrier 90. This is achieved with "
+         "SCHEMATIC Tx/Rx positions (+-0.5 m), so the material field is absorbing geometry error: the fitted eps' (median 5.2) differs from the SFCW-alone "
+         "(3.2) and UWB-alone (1.6) fields of the same scene, which is the cross-band caveat.",
+}
+
 # ----------------------------------------------------------------------------- fit command
 def cmd_fit(a):
     os.makedirs(OUT, exist_ok=True)
@@ -157,7 +175,7 @@ def fig_sfcw(tnp, z, tag, path):
     fig, ax = plt.subplots(2, 4, figsize=(22, 10))
     for j, (X, t) in enumerate(((G, "GT (pooled 5 recordings)"), (A0, "rendered, iter 0 (uniform concrete)"), (A1, "rendered, trained (SFCW alone)"))):
         im = ax[0, j].imshow(X, aspect="auto", origin="lower", extent=[r[0], r[-1], 0, 400], vmin=vmin, vmax=vmax, cmap="viridis")
-        ax[0, j].set_title(f"SFCW |range profile| per pair, dB rel. median: {t}"); ax[0, j].set_xlabel("range [m]"); ax[0, j].set_ylabel("Tx-Rx pair (tx-major)")
+        ax[0, j].set_title(f"|rp| per pair, dB rel. median\n{t}", fontsize=10); ax[0, j].set_xlabel("range [m]"); ax[0, j].set_ylabel("Tx-Rx pair (tx-major)")
         plt.colorbar(im, ax=ax[0, j], label="dB")
         ax[1, j].plot(r, G.mean(0), "k", lw=1.5, label="GT"); ax[1, j].plot(r, X.mean(0), "r" if j else "k", lw=1.2, label=t if j else None)
         ax[1, j].set_xlabel("range [m]"); ax[1, j].set_ylabel("pair-mean dB rel. median"); ax[1, j].set_title("pair-mean range profile (bins 24-93 = 0.9-3.5 m)"); ax[1, j].grid(alpha=.3); ax[1, j].legend(fontsize=8)
@@ -268,6 +286,7 @@ def cmd_figures(a):
                 cells = " | ".join(f"{a[f'rx{i}']['rmse_db']:.2f}→{b[f'rx{i}']['rmse_db']:.2f} / {a[f'rx{i}']['corr']:.2f}→{b[f'rx{i}']['corr']:.2f}" for i in (1, 2, 3, 4))
                 README.append(f"| {k} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['all']['rmse_db']:.2f} → {b['all']['rmse_db']:.2f} | {a['all']['corr']:.3f} → {b['all']['corr']:.3f} | {cells} |")
         d = run["dispersion"]; f = MB.BAND_FC_GHZ[band]; dd = d[f"{f}GHz"]
+        README += ["", NOTES[band], ""]
         README += ["", f"Fitted field (best tight seed) at {f} GHz: ε′ median {dd['eps_median']:.2f} [p5 {dd['eps_p05']:.2f}, p95 {dd['eps_p95']:.2f}], σ median {dd['sigma_median']:.3f} [p5 {dd['sigma_p05']:.3f}, p95 {dd['sigma_p95']:.3f}] S/m; "
                    f"nearest ITU class: {d['nearest_itu_class']}.", ""]
         if band == "sfcw":

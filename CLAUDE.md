@@ -70,6 +70,9 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   yet**. Known limits: WiFi Tx/Rx schematic (measure them), UWB pose assumed, ITU bounds saturate in the tails
   (tighten d≤1.0, c≤0.1 S/m or use a class prior). Bounded per-point ρ (0.590) is not comparable to the ITU-bounded
   grid (0.72–0.80): the former has ±26 dB of freedom, the latter ~12 dB.
+- **Project goal (user, 2026-10-28): train on ONE modality (two jointly only as a lower-preference alternative) and
+  evaluate ZERO-SHOT transfer to the other bands.** Single-modality training check: `viz/render_vs_gt_v2/README.md`
+  (T19). Geometry videos: `viz/geometry_v2/` (mp4s git-ignored, on workstation + node).
 - Progress on all open items: `docs/plans/OPEN_ITEMS_TRACKER.md`.
 - RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
