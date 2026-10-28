@@ -17,3 +17,6 @@ nbs/output/
 nbs/logs/
 /data/
 /runs/
+
+# videos: ~20 MB each, kept on the workstation (viz/geometry_v2/) and the node, not in git
+viz/**/*.mp4
