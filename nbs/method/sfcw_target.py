@@ -75,15 +75,24 @@ def residual_autocorr(V: torch.Tensor, H_mean: torch.Tensor, mask: torch.Tensor,
     return rho, float(T / (1 + 2 * s))
 
 
-def sfcw_static_target(V, guard_lo: int = 6, guard_hi: int = 6, split: bool = True) -> dict:
-    V = _to_torch(V); T, P, K = V.shape
+def sfcw_static_target(V, guard_lo: int = 6, guard_hi: int = 6, split: bool = True,
+                       coupling: str | None = None, window: str = "hann") -> dict:
+    """``coupling``: None (as recorded) | 'tone1' | 'tone2' = remove the per-frame direct-coupling tones first
+    (method.sfcw_coupling.fit_coupling). ``window``: 'hann' (default, unchanged) | 'bh4' | 'kaiser9' for the
+    range compression (the renderer must use the same: sfcw_coupling.range_compress)."""
+    V = _to_torch(V)
+    if coupling:
+        from method import sfcw_coupling as SC
+        V = SC.fit_coupling(V, n_tones=int(coupling[-1]))["V_clean"]
+    rc = RA.sfcw_range_compress if window == "hann" else (lambda H: __import__("method.sfcw_coupling", fromlist=["range_compress"]).range_compress(H, window))
+    T, P, K = V.shape
     mask = guard_mask(K, guard_lo, guard_hi)
-    H_mean = V.mean(0); rp_mean = RA.sfcw_range_compress(H_mean)
-    out = dict(H_mean=H_mean, rp_mean=rp_mean, mask=mask, T=T, guard=(guard_lo, guard_hi),
+    H_mean = V.mean(0); rp_mean = rc(H_mean)
+    out = dict(H_mean=H_mean, rp_mean=rp_mean, mask=mask, T=T, guard=(guard_lo, guard_hi), coupling=coupling, window=window,
                range_m=torch.from_numpy(np.asarray(SF.range_axis_m(K, VR.BANDWIDTH_HZ), dtype=np.float32)))
     if split:
-        rp_a, rp_b = (RA.sfcw_range_compress(V[0::2].mean(0)), RA.sfcw_range_compress(V[1::2].mean(0)))
-        rp_c1, rp_c2 = (RA.sfcw_range_compress(V[:T // 2].mean(0)), RA.sfcw_range_compress(V[T // 2:].mean(0)))
+        rp_a, rp_b = (rc(V[0::2].mean(0)), rc(V[1::2].mean(0)))
+        rp_c1, rp_c2 = (rc(V[:T // 2].mean(0)), rc(V[T // 2:].mean(0)))
         out["rel"] = _corr_pairs(rp_a.abs(), rp_b.abs()).clamp(0, 1)
         out["rel_contig"] = _corr_pairs(rp_c1.abs(), rp_c2.abs()).clamp(0, 1)
         out["coh"] = ((rp_a * rp_b.conj()).sum(0).abs() / torch.sqrt((rp_a.abs() ** 2).sum(0) * (rp_b.abs() ** 2).sum(0) + EPS)).clamp(0, 1)
@@ -106,13 +115,16 @@ def load_recording(rec_or_path: str):
     return _to_torch(V), t, p
 
 
-def pool_recordings(recs: list[str], guard_lo: int = 6, guard_hi: int = 6) -> dict:
+def pool_recordings(recs: list[str], guard_lo: int = 6, guard_hi: int = 6,
+                    coupling: str | None = None, window: str = "hann") -> dict:
     """Pooled static target over recordings of the same scene, each weighted by its frame count."""
     targets, Hs, Ts, names = [], [], [], []
     for r in recs:
-        V, _, p = load_recording(r); tg = sfcw_static_target(V, guard_lo, guard_hi)
+        V, _, p = load_recording(r); tg = sfcw_static_target(V, guard_lo, guard_hi, coupling=coupling, window=window)
         targets.append(tg); Hs.append(tg["H_mean"] * tg["T"]); Ts.append(tg["T"]); names.append(os.path.basename(p))
-    H_pool = torch.stack(Hs).sum(0) / sum(Ts); rp_pool = RA.sfcw_range_compress(H_pool)
+    H_pool = torch.stack(Hs).sum(0) / sum(Ts)
+    rc = RA.sfcw_range_compress if window == "hann" else (lambda H: __import__("method.sfcw_coupling", fromlist=["range_compress"]).range_compress(H, window))
+    rp_pool = rc(H_pool)
     mask = targets[0]["mask"]
     mags = [tg["rp_mean"].abs() for tg in targets]
     xc = []
@@ -123,7 +135,7 @@ def pool_recordings(recs: list[str], guard_lo: int = 6, guard_hi: int = 6) -> di
     # pooled fast-noise reliability from the individual targets (frame-weighted mean)
     rel = torch.stack([tg["rel"] * tg["T"] for tg in targets]).sum(0) / sum(Ts)
     snr = torch.stack([tg["snr_db"] for tg in targets])
-    return dict(H_mean=H_pool, rp_mean=rp_pool, mask=mask, T=sum(Ts), rel=rel, xcorr=xcorr, per_rec=targets,
+    return dict(H_mean=H_pool, rp_mean=rp_pool, mask=mask, T=sum(Ts), rel=rel, xcorr=xcorr, per_rec=targets, coupling=coupling, window=window,
                 names=names, range_m=targets[0]["range_m"], snr_db=10 * torch.log10((10 ** (snr / 10)).sum(0)),
                 summary=dict(n_rec=len(recs), T_total=sum(Ts), xcorr_median=float(xcorr[mask].median()),
                              xcorr_min=float(xcorr[mask].min()), rel_median=float(rel[mask].median())))
