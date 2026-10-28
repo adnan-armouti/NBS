@@ -1,8 +1,8 @@
 # Open items after Task B: findings and plans (2026-10-28)
 
 Sources read for this: Hofmann et al. code `nihofm/inverse-radar-rendering` (slang SFCW kernels, MAROON data layout),
-Vayyar IMAGEVK-74 datasheet + API guide (`pdfs` of the old NBS checkout; the Mini-Circuits VTRIG-74 download is bot-gated
-and could not be fetched from this machine), the OctoNet paper tables and the `aiot-lab/OctoNet` loader, and probes run
+Vayyar IMAGEVK-74 datasheet + API guide (`pdfs` of the old NBS checkout) and, since the evening, `pdf/VTRIG-74.pdf` (the
+same datasheet, 2019 revision: same figure, no element spacing/order; adds 62–69 GHz band, 2–151 points, NVM calibration), the OctoNet paper tables and the `aiot-lab/OctoNet` loader, and probes run
 on the node today (UWB pickle stream, Vayyar coupling / phase coherence).
 
 Two corrections to yesterday's statements come first, because they change the plans:
