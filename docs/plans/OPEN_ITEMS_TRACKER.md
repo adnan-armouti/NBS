@@ -20,10 +20,10 @@ rationale: `docs/plans/2026-10-28_open_items.md` (§ numbers below refer to it).
 | T13 | Complex (phase-coherent) L1 loss + sub-wavelength registration (§1 item 2) | blocked | needs T5–T7 | — | after T5 | — |
 | T14 | GGX roughness field on top of ITU Fresnel (§1 item 3) | todo | identifiable from UWB/WiFi incidence diversity | — | after T12 | — |
 | T15 | Radar mount yaw, coarse-to-fine on RA (§4b) | blocked | single coarse peak > 3σ; fine ±0.5° | — | needs T5–T7 | — |
-| T16 | UWB pulse template from the coupling peak (§4c) | todo | head's CIR matches the measured coupling shape | `4DPS/mm4DPS/octonet_heads.py` | one day; independent | — |
+| T16 | UWB pulse template from the coupling peak (§4c) | template done 10-28; head wiring todo | head's CIR matches the measured coupling shape | `nbs/method/uwb_template.py`, `viz/render_vs_gt/uwb_template.png`, node `uwb_template_S1/template.npz` | wire `t_rf` into `uwb_head` as the range kernel once agents A–C are off the heads; subtract the 4.5 cm on-board delay | main |
 | T17 | UWB / WiFi static targets (reliability-weighted, like T2) | todo | cross-rec corr per bin/subcarrier | — | prerequisite of T12 | — |
 | T18 | OctoNet in the 4DPS chain / Workspace layout | deferred | — | `4DPS/docs/OCTONET.md` item 6 | only if the chain is needed | — |
 
 ## History
 - 10-27: T1, T2 done; Task B done (`4DPS/docs/OCTONET.md`).
-- 10-28: T3 fixed (UWB had been read as one frame); plan written; T4, T5–T7, T9 launched in parallel on the node.
+- 10-28: T3 fixed (UWB had been read as one frame); plan written; T4, T5–T7, T9 launched in parallel on the node. T16 template measured: fc 7.00 GHz, −10 dB BW 1.46 GHz (the paper's 2.5 GHz is not what the data shows), FWHM 12.9 cm, coupling peak bin 7 = 4.5 cm, cross-recording corr 0.9998, template SNR 36 dB.
