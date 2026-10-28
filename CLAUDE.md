@@ -55,8 +55,17 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   (measured = scale × true: 1.027 / 1.075 / 1.167 for nodes 1/3/5, from the person range with the body-surface
   correction, confirmed by shared walls): always decode depth with `octonet_scene.load_depth_m_calibrated(png, node)`.
   Horizontal camera-to-marker offsets are unobservable (0). The subject walks IN PLACE: motion foregrounds are empty.
-- SFCW objective = `nbs/method/sfcw_target.py` (clutter-guarded temporal-mean channel, pooled over recordings,
-  per-bin cross-recording reliability; residual is drift with n_eff ≈ 4 frames). Details in `viz/README.md`.
+- SFCW objective = `nbs/method/sfcw_target.py` (temporal-mean channel pooled over recordings, two-tone on-board
+  coupling removed, per-bin cross-recording reliability; residual is drift with n_eff ≈ 4 frames). **Range bins < 24
+  (0.9 m) are the node's own near-field return (cover/housing/table), absent from the scaffold: the static fit masks
+  them (`octonet_fit` GUARD_LO=24)**; they are not window leakage (T4). Details in `viz/README.md`, tracker T4.
+- **Person detectability (T9, 14 recordings): no band passes** (SFCW z −0.1, UWB 2.3, WiFi 0.0 against permutation
+  nulls); no person term is built. UWB shows a weak direct-return effect only on large-motion activities.
+- UWB static target: the coherent RF temporal mean is valid (frame coherence 0.985); WiFi: the complex mean is destroyed
+  by per-packet carrier phase (coherence 0.01) → magnitude-only target, mask subcarriers [5,33,47,66,80,108]
+  (`nbs/method/rf_static_targets.py`). UWB pulse template from the coupling peak: fc 7.0 GHz, −10 dB BW 1.46 GHz,
+  FWHM 12.9 cm, on-board delay 4.5 cm (`nbs/method/uwb_template.py`); the paper's "2.5 GHz" is not what the data shows.
+- Progress on all open items: `docs/plans/OPEN_ITEMS_TRACKER.md`.
 - RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped
   (nominal D455 87°×58°). Per-node clip stamps differ by ~1 s: resolve paths via `cut_manual.csv`
