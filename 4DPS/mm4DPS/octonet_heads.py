@@ -6,7 +6,7 @@ records slow-time Doppler); the range kernel is what differs per head:
 
     SFCW  : stepped-frequency channel -> Hann IFFT over the 100 tones (3.75 cm bins)
     Wi-Fi : 114 subcarriers over 40 MHz, bistatic Tx -> scatterer -> Rx (+ explicit LOS)
-    UWB   : Gaussian-modulated 2.5 GHz pulse at delay (Rt+Rr)/c on the X4's 1535-bin grid
+    UWB   : the measured X4 pulse template (fc 7.0 GHz, BW 1.46 GHz; Gaussian fallback) at delay (Rt+Rr)/c on the 1535-bin grid, on-board delay included
 
 Shared input convention (what ``mm4DPS.octonet`` produces from the scaffold + calibration):
     cloud    : dict(xyz (N,3) float64 tensor [MoCap world, m], normals (N,3) float64 tensor or None)
@@ -21,7 +21,7 @@ The SFCW math is single-sourced in nbs/method/sfcw_forward.py (reflectivity, geo
 ``sfcw_head`` only vectorises its per-pair loop and is asserted equal to it in ``selftest``.
 """
 from __future__ import annotations
-import argparse, math, sys
+import argparse, math, os, sys
 import numpy as np
 import torch
 
@@ -30,17 +30,46 @@ from method import sfcw_forward as SF
 from method import wifi_forward as WF
 from method.freq_material import C_LIGHT, ITU_GT, reflectivity as itu_reflectivity
 from preprocessing import vayyar_radar_config as VR
+from preprocessing import octonet_config as C
 from preprocessing import octonet_scene as S
 from mm3DPS.data import ra_utils as RA
 
 SFCW_FREQS_HZ = SF.sfcw_freqs_hz(VR.F_START_HZ, VR.F_STOP_HZ, VR.N_FREQ)      # (100,)
 SFCW_BIN_M = VR.RANGE_RES_M                                                   # 0.0375
 WIFI_SC_GHZ = WF.subcarrier_ghz(fc_ghz=S.WIFI["fc_hz"] / 1e9, bw_mhz=S.WIFI["bw_hz"] / 1e6, n_sc=S.WIFI["n_sub"])
-UWB_F_LO_HZ, UWB_F_HI_HZ = 7.25e9, 10.2e9            # Novelda X4 band; centre 8.725 GHz, BW ~2.5-2.95 GHz
-UWB_FC_HZ = 0.5 * (UWB_F_LO_HZ + UWB_F_HI_HZ)
-UWB_BW_HZ = S.UWB["bandwidth_hz"]                     # 2.5e9 (paper)
-UWB_BIN_M = S.UWB["bin_m"]                            # 9.9/1535 one-way range per bin
+# UWB constants from the DATA (nbs/method/uwb_template.py, T16): RF-sampled frames at 23.328 GS/s, carrier 7.0 GHz,
+# -10 dB bandwidth 1.46 GHz (the paper's 2.5 GHz is not what the frames show), on-board delay = coupling peak at bin 7.
+UWB_FS_HZ = 23.328e9
+UWB_BIN_M = C_LIGHT / (2.0 * UWB_FS_HZ)              # 6.43 mm one-way per bin (9.9 m / 1535 agrees)
 UWB_N_BINS = S.UWB["n_bins"]
+UWB_FC_HZ, UWB_BW_HZ = 7.0e9, 1.46e9                 # fallback Gaussian only; the measured template is used when present
+UWB_TEMPLATE_PATH = os.path.join(os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT), "uwb_template_S1", "template.npz")
+_UWB_TEMPLATE = {}
+
+
+def uwb_template(device):
+    """(t_rf (K,), t_env (K,), centre index, on-board delay in bins) from the measured coupling peak, or None."""
+    key = str(device)
+    if key not in _UWB_TEMPLATE:
+        if os.path.exists(UWB_TEMPLATE_PATH):
+            z = np.load(UWB_TEMPLATE_PATH)
+            t_rf = torch.as_tensor(z["t_rf"], dtype=torch.float64, device=device); t_env = torch.as_tensor(z["t_env"], dtype=torch.float64, device=device)
+            half = int(z["half_width_bins"]) if "half_width_bins" in z.files else len(t_rf) // 2
+            peak = int(round(float(z["per_recording_peak_bin"]))) if "per_recording_peak_bin" in z.files else 7
+            _UWB_TEMPLATE[key] = (t_rf / t_rf.abs().max(), t_env / t_env.max(), half, peak)
+        else:
+            _UWB_TEMPLATE[key] = None
+    return _UWB_TEMPLATE[key]
+
+
+def _interp1(table: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Linear interpolation of ``table`` (K,) at fractional indices ``x`` (differentiable in x), 0 outside."""
+    K = table.shape[0]
+    x0 = torch.floor(x); f = x - x0; i0 = x0.long()
+    inside = (i0 >= 0) & (i0 < K - 1)
+    i0c = i0.clamp(0, K - 2)
+    y = table[i0c] * (1 - f) + table[i0c + 1] * f
+    return torch.where(inside, y, torch.zeros_like(y))
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -144,14 +173,25 @@ def wifi_head(cloud: dict, material: dict, sensor: dict) -> torch.Tensor:
 
 # ----------------------------------------------------------------------------- UWB head
 def uwb_pulse(r_rel: torch.Tensor, rf: bool) -> torch.Tensor:
-    """Range-domain pulse: Gaussian envelope whose round-trip FWHM is c/B (one-way sigma
-    c/(2B)/2.355), optionally carrying the RF carrier cos(4 pi fc r / c) (the X4 frame is a real
-    sampled RF/baseband waveform; the incoherent envelope is the robust comparison)."""
+    """Range-domain pulse at offset ``r_rel`` (m, one-way) from a path's delay: the MEASURED X4 template (RF with
+    carrier, or its envelope) from the direct-coupling peak when available, else a Gaussian of the measured
+    bandwidth with the carrier cos(4 pi fc r / c). The measured frame is RF-sampled, so ``rf=True`` is the
+    comparable output; the envelope is the incoherent fallback."""
+    tpl = uwb_template(r_rel.device)
+    if tpl is not None:
+        t_rf, t_env, half, _ = tpl
+        return _interp1(t_rf if rf else t_env, r_rel / UWB_BIN_M + half)
     sig = (C_LIGHT / UWB_BW_HZ) / 2.0 / 2.355
     env = torch.exp(-0.5 * (r_rel / sig) ** 2)
     if rf:
         env = env * torch.cos(4.0 * math.pi * UWB_FC_HZ * r_rel / C_LIGHT)
     return env
+
+
+def uwb_range_offset_m(device="cpu") -> float:
+    """Measured ranges = true one-way range + the on-board delay (the coupling peak's bin)."""
+    tpl = uwb_template(device)
+    return (tpl[3] * UWB_BIN_M) if tpl is not None else 0.0
 
 
 def uwb_head(cloud: dict, material: dict, sensor: dict, chunk: int = 8192, beam_deg: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -169,7 +209,7 @@ def uwb_head(cloud: dict, material: dict, sensor: dict, chunk: int = 8192, beam_
     if beam_deg is not None:
         cosang = (rel @ bore) / R
         amp = amp * (cosang > math.cos(math.radians(beam_deg))).to(amp.dtype)
-    grid = torch.arange(UWB_N_BINS, dtype=torch.float64, device=dev) * UWB_BIN_M             # (B,)
+    grid = torch.arange(UWB_N_BINS, dtype=torch.float64, device=dev) * UWB_BIN_M - uwb_range_offset_m(dev)   # (B,) measured bin -> true range
     rf = torch.zeros(UWB_N_BINS, dtype=torch.float64, device=dev); env = torch.zeros_like(rf)
     for lo in range(0, xyz.shape[0], chunk):
         rr = grid[None, :] - R[lo:lo + chunk, None]                                           # (M,B)
@@ -234,11 +274,13 @@ def selftest(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> bo
     check(f"WiFi LOS term -> first tap (d={d:.2f} m, tap {tap}, expect {round(d / 7.5)})", tap == round(d / 7.5))
     # --- UWB: target at 3 m -> bin 465 (+-2); two targets; gradient
     clu = _cloud([pos0 + bore * 3.0], None, device); mu = _material(1, device, grad=True)
-    rf, env = uwb_head(clu, mu, sensor); k = int(env.argmax()); check(f"UWB point target 3 m -> bin {k} (expect {round(3.0 / UWB_BIN_M)})", abs(k - round(3.0 / UWB_BIN_M)) <= 2)
+    off = uwb_range_offset_m(device) / UWB_BIN_M
+    rf, env = uwb_head(clu, mu, sensor); k = int(env.argmax()); check(f"UWB point target 3 m -> bin {k} (expect {round(3.0 / UWB_BIN_M + off)}, incl. {off:.0f}-bin on-board delay)", abs(k - round(3.0 / UWB_BIN_M + off)) <= 2)
     env.sum().backward(); check("UWB gradient flows", mu["rho"].grad is not None and torch.isfinite(mu["rho"].grad).all())
     clu2 = _cloud([pos0 + bore * 1.0, pos0 + bore * 2.0], None, device); _, env2 = uwb_head(clu2, _material(2, device), sensor)
     k1 = int(env2[:233].argmax()); k2 = int(env2[233:].argmax()) + 233
-    check("UWB two targets 1/2 m resolved", abs(k1 - round(1.0 / UWB_BIN_M)) <= 2 and abs(k2 - round(2.0 / UWB_BIN_M)) <= 2, f"(bins {k1},{k2})")
+    check("UWB two targets 1/2 m resolved", abs(k1 - round(1.0 / UWB_BIN_M + off)) <= 2 and abs(k2 - round(2.0 / UWB_BIN_M + off)) <= 2, f"(bins {k1},{k2})")
+    tpl = uwb_template(device); check("UWB measured pulse template loaded" if tpl is not None else "UWB template missing -> Gaussian fallback", True, "" if tpl is None else f"(K={tpl[0].shape[0]}, delay {tpl[3]} bins)")
     print("octonet_heads selftest:", "ALL PASS" if ok else "FAILURES")
     return ok
 

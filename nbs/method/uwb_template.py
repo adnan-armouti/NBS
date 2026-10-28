@@ -89,7 +89,8 @@ def main():
                                              if k in ("n_frames", "rate_hz", "peak_bin", "fc_hz", "bw_10db_hz", "fwhm_m", "w10db_m", "template_snr_db")} for r in res},
                    note="RF template (carrier included) centred on the coupling peak; the head's range kernel = t_rf shifted to each path delay; "
                         "t_env for an incoherent comparison. The coupling peak sits at ~bin %d = %.2f m: the on-board delay to subtract from ranges." % (res[0]["peak_bin"], res[0]["peak_bin"] * BIN_M))
-    np.savez(os.path.join(out, "template.npz"), t_rf=T, t_env=E, **{k: v for k, v in summary.items() if not isinstance(v, (dict, str))})
+    np.savez(os.path.join(out, "template.npz"), t_rf=T, t_env=E, per_recording_peak_bin=float(np.median([r["peak_bin"] for r in res])),
+             **{k: v for k, v in summary.items() if not isinstance(v, (dict, str))})
     json.dump(summary, open(os.path.join(out, "template.json"), "w"), indent=1)
     print(json.dumps({k: v for k, v in summary.items() if k != "per_recording"}, indent=1))
     for r in res: print(r["rec"], {k: round(float(r[k]), 4) if isinstance(r[k], (float, np.floating)) else r[k] for k in ("n_frames", "peak_bin", "fc_hz", "bw_10db_hz", "fwhm_m", "template_snr_db")})
