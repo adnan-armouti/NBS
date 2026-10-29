@@ -41,6 +41,7 @@ NOISE_DIR = os.path.join(DATA_OUT, "noise_S1")
 # aperture -> 0.7 m; X4 ~2 cm -> 2 cm): the region is the extent of the structure the scaffold does not contain.
 NEAR_BINS = dict(sfcw=24, uwb=int(round(1.0 / OH.UWB_BIN_M)))
 ADOPT_CORR = 0.9                      # the adoption rule (see module docstring)
+END_BINS = 80                         # UWB frame-end artefact region (last 0.51 m of the 9.87 m frame)
 PERSON_MARGIN_M = 0.75                # 4DPS noise-envelope default
 N_COEFF = 8
 EPS = 1e-30
@@ -121,22 +122,29 @@ def with_floored_magnitude(rp: torch.Tensor, power: torch.Tensor) -> torch.Tenso
 
 # ----------------------------------------------------------------------------- the coupling block (port)
 class CouplingBlock:
-    """Per-channel coherent near-bin block in product units (complex (C, near) for SFCW, real RF (near,) for UWB)."""
+    """Per-channel coherent near-bin block in product units (complex (C, near) for SFCW, real RF (near,) for UWB), plus an
+    optional END block on the last bins (UWB: the X4 frame-end artefact, a static return at the last bin in every recording
+    and every scene; same measurement and adoption rule as the near block)."""
 
-    def __init__(self, block: np.ndarray, adopt_from_bin: int, device="cpu"):
+    def __init__(self, block: np.ndarray, adopt_from_bin: int, device="cpu", end_block: np.ndarray | None = None, end_adopted: bool = False):
         self.block = torch.as_tensor(block, device=device)
         self.near = int(self.block.shape[-1]); self.adopt_from_bin = int(adopt_from_bin)
+        self.end_block = torch.as_tensor(end_block, device=device) if (end_block is not None and end_adopted) else None
+        self.n_end = int(self.end_block.shape[-1]) if self.end_block is not None else 0
 
     def add(self, x: torch.Tensor) -> torch.Tensor:
-        """x (..., K) + the block on bins [0, near)."""
-        pad = torch.zeros(x.shape[-1] - self.near, dtype=self.block.dtype, device=x.device)
-        b = torch.cat([self.block.to(x.device), pad.expand(*self.block.shape[:-1], -1)], dim=-1)
-        return x + b.to(x.dtype)
+        """x (..., K) + the block on bins [0, near) (+ the end block on bins [K - n_end, K))."""
+        K = x.shape[-1]
+        mid = torch.zeros(K - self.near - self.n_end, dtype=self.block.dtype, device=x.device)
+        parts = [self.block.to(x.device), mid.expand(*self.block.shape[:-1], -1)]
+        if self.n_end: parts.append(self.end_block.to(x.device).expand(*self.block.shape[:-1], -1) if self.block.dim() > 1 else self.end_block.to(x.device))
+        return x + torch.cat(parts, dim=-1).to(x.dtype)
 
     @staticmethod
     def load(band: str, device="cpu") -> "CouplingBlock":
         z = np.load(os.path.join(NOISE_DIR, f"{band}_coupling.npz"))
-        return CouplingBlock(z["block"], int(z["adopt_from_bin"]), device=device)
+        return CouplingBlock(z["block"], int(z["adopt_from_bin"]), device=device, end_block=(z["end_block"] if "end_block" in z.files else None),
+                             end_adopted=bool(z["end_adopted"]) if "end_adopted" in z.files else False)
 
 
 def coupling_available(band: str) -> bool:
@@ -234,7 +242,7 @@ def measure_uwb(recs: list[str], device=None) -> dict:
     """Envelope prior (1535,) power and the RF coupling block (155,) from the held-out recordings' UWB streams."""
     from method.uwb_template import uwb_path_for, analytic
     near = NEAR_BINS["uwb"]
-    pw, blocks, Fs, names = [], [], [], []
+    pw, blocks, ends, Fs, names = [], [], [], [], []
     for r in recs:
         stamp = os.path.basename(r)[:14] if os.path.isabs(r) else r
         p = uwb_path_for(stamp); names.append(os.path.basename(p))
@@ -242,7 +250,7 @@ def measure_uwb(recs: list[str], device=None) -> dict:
         mean = fr.mean(0); an_mean = analytic(mean)
         resid = np.zeros(fr.shape[1])
         for f in fr: resid += np.abs(analytic(f) - an_mean) ** 2
-        pw.append(resid / len(fr)); blocks.append(mean[:near]); Fs.append(len(fr))
+        pw.append(resid / len(fr)); blocks.append(mean[:near]); ends.append(mean[-END_BINS:]); Fs.append(len(fr))
     power = np.median(np.stack(pw), 0)
     # the person's range band (subject at the MoCap origin), dropped and interpolated in the log as in 4DPS
     ext = json.load(open(os.path.join(DATA_OUT, "calib_S1", "extrinsics.json")))
@@ -254,6 +262,12 @@ def measure_uwb(recs: list[str], device=None) -> dict:
     F = np.asarray(Fs, float); block = (np.stack(blocks) * F[:, None]).sum(0) / F.sum()
     coherence = float((block ** 2).mean() / max(np.mean([b ** 2 for b in blocks]), 1e-300))
     z = np.load(os.path.join(DATA_OUT, "uwb_target_S1", "target_pool5.npz")); pool_rf = z["mean_rf"]
+    # the frame-END artefact (last END_BINS): a static return peaking at the last bin in every recording and scene (2026-10-29 diag);
+    # measured like the near block from the held-out coherent means, adopted by the same rule against the pooled target
+    end_block = (np.stack(ends) * F[:, None]).sum(0) / F.sum()
+    env_eb = np.abs(analytic(np.concatenate([np.zeros(pool_rf.shape[0] - END_BINS), end_block])))[-END_BINS:]
+    env_pe = np.abs(analytic(pool_rf))[-END_BINS:]
+    end_corr = _logmag_corr(env_eb, env_pe); end_adopted = bool(end_corr >= ADOPT_CORR)
     env_b = np.abs(analytic(np.concatenate([block, np.zeros(pool_rf.shape[0] - near)])))
     env_p = np.abs(analytic(pool_rf))
     regions = {"0-44 (direct pulse)": (0, 45), "45-154 (housing/table)": (45, near)}
@@ -267,10 +281,11 @@ def measure_uwb(recs: list[str], device=None) -> dict:
              model="power of the frame-to-frame residual of the analytic RF frame about each recording's coherent mean, median over 5 held-out recordings, person band +-0.75 m dropped and interpolated, normalised to its median over bins >= 155")
     np.savez(os.path.join(NOISE_DIR, "uwb_coupling.npz"), block=block.astype(np.float64), adopt_from_bin=adopt, near_bins=near, coherence=coherence,
              corr_vs_pool=json.dumps(corr), rf_corr_vs_pool=json.dumps(rf_corr), frames=F, recordings=np.array(names),
-             model="frame-weighted coherent mean over frames and 5 held-out recordings of the RF frame at bins < 155 (1.0 m)")
+             end_block=end_block.astype(np.float64), end_bins=END_BINS, end_corr_vs_pool=end_corr, end_adopted=end_adopted,
+             model="frame-weighted coherent mean over frames and 5 held-out recordings of the RF frame at bins < 155 (1.0 m); end_block = the same at the last END_BINS (frame-end artefact)")
     return dict(band="uwb", recordings=names, frames=Fs, envelope_level=level, person_band_m=[centre - PERSON_MARGIN_M, centre + PERSON_MARGIN_M],
                 envelope_shape_range=[float(power.min() / level), float(power.max() / level)], coupling_coherent_fraction=coherence,
-                coupling_env_corr_vs_pool=corr, coupling_rf_corr_vs_pool=rf_corr, adopt_from_bin=adopt)
+                coupling_env_corr_vs_pool=corr, coupling_rf_corr_vs_pool=rf_corr, adopt_from_bin=adopt, end_bins=END_BINS, end_corr_vs_pool=end_corr, end_adopted=end_adopted)
 
 
 def cmd_measure(a):

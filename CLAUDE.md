@@ -83,6 +83,11 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
 - **Project goal (user, 2026-10-28): train on ONE modality (two jointly only as a lower-preference alternative) and
   evaluate ZERO-SHOT transfer to the other bands.** Single-modality training check: `viz/render_vs_gt_v4/README.md`
   (v2/v3 are the grid-era history). Geometry videos: `viz/geometry_v2/` (mp4s git-ignored, on workstation + node).
+- **T20 state (2026-10-29): zero-shot transfer is ZERO** for every material form (`4DPS/mm4DPS/octonet_zero_shot.py`: transfer =
+  uniform-concrete baseline; SFCW→UWB 0.657 vs 0.658, UWB→SFCW 0.622 vs 0.630). The per-point in-band gain beyond the receiver
+  nuisances is memorisation (fitted maps uncorrelated between bands). Do not claim band synthesis; next = T28 synthetic
+  identifiability test, T30 material-free pose sweeps (nuisance-only fits), T29 room planes + ITU-class prior
+  (`docs/plans/2026-10-29_forward_plan.md`). UWB last 80 bins (frame-end artefact) are masked; WiFi fits use lr 0.01 / 600 steps.
 - **Match 3DPS/4DPS before inventing (user, 2026-10-29)**: when a component is missing (noise model, near field, material
   storage), port the 3DPS/4DPS one first; a data-driven shortcut is not acceptable where a physics-informed model exists
   in those repos. Noise floor and coupling block: `4DPS/mm4DPS/octonet_noise.py` (measured from held-out recordings).

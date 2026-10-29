@@ -101,10 +101,13 @@ class PerPointMaterial(torch.nn.Module):
     thickness) per point through ``reparameterize_torch``. ``material_at`` returns the heads' material dict."""
 
     def __init__(self, xyz: torch.Tensor, init_abcd=ITU_GT["concrete"], noise: float = 0.01, free_exponents: bool = False,
-                 init_rough: dict | None = None):
+                 init_rough: dict | None = None, smooth_knn: float = 0.0, k: int = 8):
         super().__init__()
         from mm3DPS.rasterizer import reparameterize_torch
         n = xyz.shape[0]; dev = xyz.device
+        self.smooth_knn = float(smooth_knn)
+        if self.smooth_knn > 0:                       # graph Laplacian prior: neighbours on the same surface share a material
+            self.register_buffer("nbr", knn_indices(xyz, k))
         base = raw_from_abcd(init_abcd).to(dev)
         self.raw_ac = torch.nn.Parameter(base[[0, 2]].expand(n, 2).clone() + noise * torch.randn(n, 2, dtype=torch.float64, device=dev))
         bd = base[[1, 3]].expand(n, 2).clone()
@@ -126,8 +129,12 @@ class PerPointMaterial(torch.nn.Module):
         return dict(abcd=abcd, sigma_h=six[:, 2], l_c=six[:, 3], tau=six[:, 4], thickness=six[:, 5], rho=None)
 
     def reg(self) -> torch.Tensor:
-        """L2 to the init in raw space (the per-point prior; the grid has TV instead)."""
-        return ((self.raw_ac - self.raw_ac0) ** 2).mean() + ((self.raw_rough - self.raw_rough0) ** 2).mean()
+        """L2 to the init in raw space (the per-point prior; the grid has TV instead), plus the kNN Laplacian when ``smooth_knn`` > 0."""
+        r = ((self.raw_ac - self.raw_ac0) ** 2).mean() + ((self.raw_rough - self.raw_rough0) ** 2).mean()
+        if self.smooth_knn > 0:
+            for raw in (self.raw_ac, self.raw_rough):
+                r = r + self.smooth_knn * ((raw[:, None, :] - raw[self.nbr]) ** 2).mean()
+        return r
 
     def tv(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float64, device=self.raw_ac.device)
@@ -135,6 +142,45 @@ class PerPointMaterial(torch.nn.Module):
     @property
     def voxel_m(self) -> float:
         return 0.0
+
+
+def knn_indices(xyz: torch.Tensor, k: int = 8, chunk: int = 4096) -> torch.Tensor:
+    """(N,k) indices of the k nearest other points (chunked cdist)."""
+    out = []
+    for lo in range(0, xyz.shape[0], chunk):
+        d = torch.cdist(xyz[lo:lo + chunk], xyz); d[torch.arange(d.shape[0]), torch.arange(lo, lo + d.shape[0])] = float("inf")
+        out.append(d.topk(k, dim=1, largest=False).indices)
+    return torch.cat(out)
+
+
+class SegmentMaterial(torch.nn.Module):
+    """One six-parameter material per scaffold SEGMENT (k-means on position + normal): the room as a handful of materials.
+    Same parametrisation as PerPointMaterial, expanded to the points by the segment label."""
+
+    def __init__(self, xyz: torch.Tensor, normals: torch.Tensor | None, segments: int = 16, init_abcd=ITU_GT["concrete"], noise: float = 0.01, iters: int = 30, seed: int = 0):
+        super().__init__()
+        dev = xyz.device; n = xyz.shape[0]
+        nrm = torch.zeros_like(xyz) if normals is None else normals
+        feat = torch.cat([xyz / 1.0, 0.5 * nrm], 1)                      # 0.5 m of position ~ one unit of normal
+        g = torch.Generator(device=dev).manual_seed(seed)
+        centres = feat[torch.randperm(n, generator=g, device=dev)[:segments]].clone()
+        for _ in range(iters):
+            lab = torch.cdist(feat, centres).argmin(1)
+            for j in range(segments):
+                sel = lab == j
+                if sel.any(): centres[j] = feat[sel].mean(0)
+        self.register_buffer("labels", torch.cdist(feat, centres).argmin(1))
+        self.inner = PerPointMaterial(centres[:, :3], init_abcd=init_abcd, noise=noise)
+        self.segments = segments
+
+    def material_at(self, xyz=None) -> dict:
+        m = self.inner.material_at(); lab = self.labels
+        return {k: (v[lab] if torch.is_tensor(v) else v) for k, v in m.items()}
+
+    def reg(self): return self.inner.reg()
+    def tv(self): return self.inner.tv()
+    @property
+    def voxel_m(self): return 0.0
 
 
 def physics_columns(mat: dict, f_ghz: float) -> np.ndarray:
@@ -160,6 +206,7 @@ def load_targets(dev, sfcw_guard: int = GUARD_LO_SFCW, uwb_guard: int | None = N
     z = np.load(os.path.join(DATA_OUT, "uwb_target_S1", "target_pool5.npz"))
     ug = ON.NEAR_BINS["uwb"] if uwb_guard is None else uwb_guard
     um = torch.as_tensor(z["mask"]).bool(); um[:ON.NEAR_BINS["uwb"]] = True; um[:ug] = False
+    um[-ON.END_BINS:] = False            # the X4 frame-end artefact (last 0.51 m): a static return peaking at the LAST bin in every recording and scene (2026-10-29 diag), not geometry
     t["uwb"] = dict(env=torch.as_tensor(z["env"], dtype=torch.float64, device=dev), rel=torch.as_tensor(z["rel"], dtype=torch.float64, device=dev).clamp(0, 1),
                     mask=um.to(dev), range_m=torch.as_tensor(z["range_m"], dtype=torch.float64, device=dev), guard_bins=ug)
     t["sfcw"]["guard_bins"] = sfcw_guard
@@ -225,20 +272,29 @@ class BandNuisance:
                     coupling=(dict(adopt_from_bin=self.block.adopt_from_bin, near_bins=self.block.near) if self.block is not None else None))
 
 
-def band_loss(band: str, cloud, material, sensors, targets, chunk=4096, nuisance: BandNuisance | None = None):
+def smooth_log(x: torch.Tensor, bins: int) -> torch.Tensor:
+    """Moving average over the last (range) axis, 'same' size (a geometry-robust view of a log-magnitude profile)."""
+    if bins <= 1: return x
+    k = torch.ones(1, 1, bins, dtype=x.dtype, device=x.device) / bins
+    y = torch.nn.functional.conv1d(x.reshape(-1, 1, x.shape[-1]), k, padding=bins // 2)[..., :x.shape[-1]]
+    return y.reshape(x.shape)
+
+
+def band_loss(band: str, cloud, material, sensors, targets, chunk=4096, nuisance: BandNuisance | None = None, smooth_bins: int = 0):
     """(scalar loss, dict of rendered quantities for figures). With ``nuisance`` the SFCW/UWB render is in absolute units
-    (gain, coupling block, floored magnitude) and the loss is un-normalised; without it, median-normalised."""
+    (gain, coupling block, floored magnitude) and the loss is un-normalised; without it, median-normalised. ``smooth_bins``
+    > 1 compares range-smoothed log magnitudes (SFCW / UWB): the material is then not asked to explain per-bin speckle."""
     if band == "sfcw":
         rp = OH.sfcw_head(cloud, material, sensors["vayyar"], chunk=chunk)
         if nuisance is not None: rp = ON.apply_sfcw(rp, nuisance.log_gain, nuisance.block, nuisance.floor)
-        loss, per_bin = ST.sfcw_static_loss(rp, targets["sfcw"], kind="logmag", weight="xcorr", normalize=nuisance is None)
+        loss, per_bin = ST.sfcw_static_loss(rp, targets["sfcw"], kind="logmag", weight="xcorr", normalize=nuisance is None, smooth_bins=smooth_bins)
         return loss, dict(rp=rp.detach())
     if band == "uwb":
         rf, _ = OH.uwb_head(cloud, material, sensors["uwb"])
         if nuisance is not None: rf, env = ON.apply_uwb(rf, nuisance.log_gain, nuisance.block, nuisance.floor)
         else: env = hilbert_env(rf)
         tg = targets["uwb"]; m = tg["mask"]; w = tg["rel"] * m
-        la = torch.log(env + EPS); lb = torch.log(tg["env"] + EPS)
+        la = smooth_log(torch.log(env + EPS), smooth_bins); lb = smooth_log(torch.log(tg["env"] + EPS), smooth_bins)
         if nuisance is None:
             la = la - la[m].median(); lb = lb - lb[m].median()
         loss = ((la - lb).abs() * w).sum() / (w.sum() + EPS)
@@ -270,14 +326,15 @@ def evaluate(bands, cloud, material, sensors, targets, nuis=None):
         return {b: band_loss(b, cloud, material, sensors, targets, nuisance=(nuis or {}).get(b))[0].item() for b in bands}
 
 
-def make_material(kind: str, cloud, voxels: int, dev, free_exponents: bool = False):
-    if kind == "per-point": return PerPointMaterial(cloud["xyz"], free_exponents=free_exponents).to(dev)
+def make_material(kind: str, cloud, voxels: int, dev, free_exponents: bool = False, smooth_knn: float = 0.0, segments: int = 16):
+    if kind == "per-point": return PerPointMaterial(cloud["xyz"], free_exponents=free_exponents, smooth_knn=smooth_knn).to(dev)
+    if kind == "segment": return SegmentMaterial(cloud["xyz"], cloud.get("normals"), segments=segments).to(dev)
     if kind == "grid": return VoxelGridMaterial(cloud["xyz"], voxels=voxels).to(dev)
     raise ValueError(kind)
 
 
 def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed=0, tag=None, verbose=True, gains=True, gain_l2=0.01, patience=60,
-        material="per-point", l2=0.05, noise_model=True, coupling=True, free_exponents=False):
+        material="per-point", l2=0.05, noise_model=True, coupling=True, free_exponents=False, smooth_knn=0.0, segments=16, smooth_loss=(0, 0)):
     """Fit the material on ``bands``. ``material``: 'per-point' (3DPS, default) or 'grid' (T11 voxel field, TV ``tv``);
     ``l2`` = the per-point prior to the init. ``noise_model`` / ``coupling`` (SFCW and UWB): the ported 4DPS nuisances
     (``octonet_noise``), each with a learned absolute gain per band; off = the scale-free median-normalised loss and the
@@ -287,7 +344,8 @@ def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed
     cloud, material0, sensors = setup(dev, n_points, seed)
     sensors = sensors_without_gains(sensors)
     targets = load_targets(dev, sfcw_guard=ON.guard_bins("sfcw", coupling), uwb_guard=ON.guard_bins("uwb", coupling))
-    grid = make_material(material, cloud, voxels, dev, free_exponents)
+    grid = make_material(material, cloud, voxels, dev, free_exponents, smooth_knn, segments)
+    sm = dict(sfcw=int(smooth_loss[0]), uwb=int(smooth_loss[1]), wifi=0)
     use_gains = bool(gains) and ("sfcw" in bands)
     g_tx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=use_gains)
     g_rx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=use_gains)
@@ -309,9 +367,9 @@ def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed
         opt.zero_grad(set_to_none=True)
         mat = grid.material_at(cloud["xyz"])
         sens = sensors_with_gains(sensors, g_tx, g_rx) if use_gains else sensors
-        parts = {b: band_loss(b, cloud, mat, sens, targets, nuisance=nuis.get(b))[0] for b in bands}
+        parts = {b: band_loss(b, cloud, mat, sens, targets, nuisance=nuis.get(b), smooth_bins=sm[b])[0] for b in bands}
         reg_g = gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean()) if use_gains else 0.0
-        reg_m = (l2 * grid.reg()) if isinstance(grid, PerPointMaterial) else (tv * grid.tv())
+        reg_m = (l2 * grid.reg()) if isinstance(grid, (PerPointMaterial, SegmentMaterial)) else (tv * grid.tv())
         total = sum(w[b] * parts[b] for b in bands) + reg_m + reg_g
         total.backward(); opt.step()
         rec = dict(step=step, total=float(total), **{b: float(parts[b]) for b in bands}, t=time.time() - t0)
@@ -342,7 +400,7 @@ def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed
         end_all = evaluate(BANDS, cloud, mat, sensors, targets, nuis)
         abcd = mat["abcd"].cpu().numpy()
     res = dict(bands=list(bands), seed=seed, points=int(cloud["xyz"].shape[0]), material=material, voxels=voxels, voxel_m=grid.voxel_m, steps=len(log), best_step=best[2],
-               l2=l2, noise_model=bool(noise_model), coupling=bool(coupling), guards=dict(sfcw=int(targets["sfcw"]["guard_bins"]), uwb=int(targets["uwb"]["guard_bins"])),
+               l2=l2, noise_model=bool(noise_model), coupling=bool(coupling), smooth_knn=smooth_knn, segments=(segments if material == "segment" else None), smooth_loss=list(smooth_loss), guards=dict(sfcw=int(targets["sfcw"]["guard_bins"]), uwb=int(targets["uwb"]["guard_bins"])),
                nuisance={b: n.state() for b, n in nuis.items()},
                start=start_all, end=end_all, log=log, runtime_s=time.time() - t0,
                gains=(dict(enabled=True, l2=gain_l2, tx_log=g_tx.detach().cpu().numpy().tolist(), rx_log=g_rx.detach().cpu().numpy().tolist(),
@@ -531,15 +589,19 @@ def figure(runs):
 
 def add_model_args(p):
     """The material / nuisance switches shared by this module's commands and the panels (octonet_eval_panels)."""
-    p.add_argument("--material", default="per-point", choices=("per-point", "grid"), help="per-point = 3DPS (default); grid = the T11 voxel ITU field")
+    p.add_argument("--material", default="per-point", choices=("per-point", "segment", "grid"), help="per-point = 3DPS (default); segment = one material per k-means segment; grid = the T11 voxel ITU field")
     p.add_argument("--l2", type=float, default=0.05, help="per-point: L2 prior to the init in raw space")
     p.add_argument("--free-exponents", action="store_true", help="per-point: also fit the ITU exponents b, d per point (joint fits only)")
     p.add_argument("--noise-model", default="on", choices=("on", "off"), help="learned receiver noise floor (4DPS model, measured prior: octonet_noise measure)")
     p.add_argument("--coupling", default="on", choices=("on", "off"), help="coherent near-field coupling block instead of the near guard (4DPS model), where adopted")
+    p.add_argument("--smooth-knn", type=float, default=0.0, help="per-point: kNN Laplacian prior weight on the raw material (0 = off)")
+    p.add_argument("--segments", type=int, default=16, help="segment material: number of k-means segments")
+    p.add_argument("--smooth-loss", default="0,0", help="range-smoothing of the log-magnitude loss in bins, 'sfcw,uwb' (0 = per-bin)")
 
 
 def fit_kwargs(a) -> dict:
-    return dict(material=a.material, l2=a.l2, noise_model=a.noise_model == "on", coupling=a.coupling == "on", free_exponents=a.free_exponents)
+    return dict(material=a.material, l2=a.l2, noise_model=a.noise_model == "on", coupling=a.coupling == "on", free_exponents=a.free_exponents,
+                smooth_knn=a.smooth_knn, segments=a.segments, smooth_loss=tuple(int(v) for v in a.smooth_loss.split(",")))
 
 
 def main(argv=None):

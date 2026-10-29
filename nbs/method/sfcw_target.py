@@ -146,7 +146,7 @@ def _pairs_to_txrx_torch(rp: torch.Tensor) -> torch.Tensor:
     return r if C.VAY_PAIR_ORDER == "tx_major" else r.transpose(0, 1)
 
 
-def sfcw_static_loss(rp_render: torch.Tensor, target: dict, kind: str = "logmag", weight: str = "rel", n_az: int = 128, normalize: bool = True):
+def sfcw_static_loss(rp_render: torch.Tensor, target: dict, kind: str = "logmag", weight: str = "rel", n_az: int = 128, normalize: bool = True, smooth_bins: int = 0):
     """Masked, reliability-weighted L1 on log-magnitude. Returns (scalar, per-bin residual (K,)).
     ``rp_render``: (400,100) complex range profiles from the renderer (already range-compressed).
     ``normalize``: subtract each side's masked median (scale-free; the default). False when the render carries an
@@ -164,6 +164,10 @@ def sfcw_static_loss(rp_render: torch.Tensor, target: dict, kind: str = "logmag"
     else:
         raise ValueError(kind)
     la = torch.log(a.abs() + EPS); lb = torch.log(b.abs() + EPS)
+    if smooth_bins > 1:                                                   # range-smoothed comparison (geometry-robust)
+        k = torch.ones(1, 1, smooth_bins, dtype=la.dtype, device=la.device) / smooth_bins
+        la = torch.nn.functional.conv1d(la[:, None, :], k, padding=smooth_bins // 2)[:, 0, :la.shape[-1]]
+        lb = torch.nn.functional.conv1d(lb[:, None, :], k, padding=smooth_bins // 2)[:, 0, :lb.shape[-1]]
     if normalize:
         la = la - la[:, mask].median(); lb = lb - lb[:, mask].median()
     res = (la - lb).abs()                                          # (P or n_az, K)

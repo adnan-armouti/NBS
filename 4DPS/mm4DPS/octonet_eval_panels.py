@@ -168,8 +168,13 @@ NOTES = {
 }
 
 # ----------------------------------------------------------------------------- fit command
+BAND_DEFAULTS = dict(sfcw=(0.03, 400), uwb=(0.03, 400), wifi=(0.01, 600))      # (lr, steps)
+
+
 def cmd_fit(a):
     os.makedirs(OUT, exist_ok=True)
+    if a.lr is None: a.lr = BAND_DEFAULTS[a.band][0]
+    if a.steps is None: a.steps = BAND_DEFAULTS[a.band][1]
     dev = torch.device(a.device); band = a.band
     seeds = [int(s) for s in a.seeds.split(",")]
     plan = [("tight", s) for s in seeds] + ([("loose", seeds[0])] if a.loose else [])
@@ -193,7 +198,7 @@ def cmd_fit(a):
         res.pop("log", None)
         json.dump(res, open(os.path.join(OUT, tag + ".json"), "w"), indent=1)
         save = dict(xyz=cloud["xyz"].cpu().numpy(), abcd=abcd, mask=tnp[band]["mask"] if band != "wifi" else np.zeros(0))
-        if isinstance(grid, MB.PerPointMaterial): save["physics"] = MB.physics_columns(mat1, MB.BAND_FC_GHZ[band])
+        save["physics"] = MB.physics_columns(mat1, MB.BAND_FC_GHZ[band])         # six columns at the band centre (default roughness for the grid)
         if gm.get("enabled"):
             save.update(gain_tx_db=np.asarray(gm["tx_db"]), gain_rx_db=np.asarray(gm["rx_db"]), gt_gain_tx_db=np.asarray(gm["gt_tx_db"]), gt_gain_rx_db=np.asarray(gm["gt_rx_db"]))
         if band == "wifi":
@@ -404,9 +409,9 @@ def cmd_figures(a):
         f"{b}: material {runs_[bt_]['material']}, noise model {'on' if runs_[bt_].get('noise_model') else 'off'}, coupling {'on' if runs_[bt_].get('coupling') else 'off'}, first supervised bin {runs_[bt_].get('guards', {}).get(b)}, nuisance {json.dumps(runs_[bt_].get('nuisance', {}).get(b))}"
         for b in ("sfcw", "uwb") for runs_ in [load_runs(b)] for bt_ in [best_tight(b, runs_)] if bt_), ""]
     README += ["## Reproduce", "", "```", "source tools/env_node.sh && cd 4DPS", "python -m mm4DPS.octonet_noise measure        # held-out envelope + coupling (once)",
-               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=3 python -m mm4DPS.octonet_eval_panels fit --band sfcw --seeds 0,1,2 --steps 400 --loose",
-               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=4 python -m mm4DPS.octonet_eval_panels fit --band uwb  --seeds 0,1,2 --steps 400 --loose",
-               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=5 python -m mm4DPS.octonet_eval_panels fit --band wifi --seeds 0,1,2 --steps 400 --loose",
+               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=3 python -m mm4DPS.octonet_eval_panels fit --band sfcw --seeds 0,1,2 --loose     # lr 0.03, 400 steps",
+               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=4 python -m mm4DPS.octonet_eval_panels fit --band uwb  --seeds 0,1,2 --loose",
+               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=5 python -m mm4DPS.octonet_eval_panels fit --band wifi --seeds 0,1,2 --loose     # lr 0.01, 600 steps",
                f"OCTONET_PANELS_TAG={_TAG} python -m mm4DPS.octonet_eval_panels figures", "```", ""]
     open(os.path.join(VIZ, "README.md"), "w").write("\n".join(README) + "\n")
     open(os.path.join(VIZ, "captions.txt"), "w").write("\n".join(captions) + "\n")
@@ -416,7 +421,7 @@ def cmd_figures(a):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fit"); f.add_argument("--band", required=True, choices=BANDS); f.add_argument("--seeds", default="0,1,2"); f.add_argument("--loose", action="store_true")
-    f.add_argument("--points", type=int, default=20000); f.add_argument("--steps", type=int, default=400); f.add_argument("--lr", type=float, default=0.03)
+    f.add_argument("--points", type=int, default=20000); f.add_argument("--steps", type=int, default=None, help="default 400 (WiFi 600)"); f.add_argument("--lr", type=float, default=None, help="default 0.03 (WiFi 0.01: at 0.03 one seed in three bounced out of its minimum, 2026-10-29)")
     f.add_argument("--voxels", type=int, default=64); f.add_argument("--tv", type=float, default=1e-3); f.add_argument("--device", default="cuda")
     f.add_argument("--no-gains", action="store_true", help="SFCW: do not fit the 20+20 per-channel gains (pre-D13 behaviour)")
     f.add_argument("--gain-l2", type=float, default=0.01, help="L2 weight on the SFCW log-amplitude channel gains")
