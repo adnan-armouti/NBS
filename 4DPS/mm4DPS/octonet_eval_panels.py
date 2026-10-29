@@ -16,8 +16,10 @@ import torch
 from mm4DPS import octonet_fit_multiband as MB
 from method.freq_material import ITU_GT
 
-OUT = os.path.join(MB.DATA_OUT, "eval_panels_S1")
-VIZ = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "viz", "render_vs_gt_v2")
+# OCTONET_PANELS_TAG selects the output set: "v2" (default, historical) or e.g. "v3" (clean rerun with the 3DPS-routed heads)
+_TAG = os.environ.get("OCTONET_PANELS_TAG", "v2")
+OUT = os.path.join(MB.DATA_OUT, "eval_panels_S1" if _TAG == "v2" else f"eval_panels_S1_{_TAG}")
+VIZ = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "viz", f"render_vs_gt_{_TAG}")
 BANDS = ("sfcw", "uwb", "wifi")
 TIGHT = dict(a=(1.0, 15.0), b=0.1, c=(1e-3, 0.1), d=1.0)
 LOOSE = dict(a=(1.0, 15.0), b=0.2, c=(1e-3, 2.0), d=1.5)
@@ -291,7 +293,7 @@ def fig_material(band, z, run, tag, path):
 def cmd_figures(a):
     os.makedirs(VIZ, exist_ok=True)
     dev = torch.device("cpu"); targets = MB.load_targets(dev); tnp = targets_np(targets)
-    README = ["# Single-modality training check (render_vs_gt_v2)", "",
+    README = [f"# Single-modality training check (render_vs_gt_{_TAG})", "",
               "Each band is fitted ALONE (its own target only) with the voxel-grid ITU material field of `4DPS/mm4DPS/octonet_fit_multiband.py` "
               "(V = 64 voxels per axis over the calibrated scaffold, 20k scaffold points, Adam lr 0.03, TV 1e-3, up to 400 steps), under TIGHT bounds "
               "(a ∈ [1,15], b ∈ ±0.1, c ≤ 0.1 S/m, d ≤ 1.0) for 3 seeds, plus one LOOSE run (b ±0.2, c ≤ 2, d ≤ 1.5). "

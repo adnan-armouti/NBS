@@ -33,6 +33,7 @@ rationale: `docs/plans/2026-10-28_open_items.md` (§ numbers below refer to it).
 
 ## History
 - 10-27: T1, T2 done; Task B done (`4DPS/docs/OCTONET.md`).
+- 10-29 (2): `viz/render_vs_gt_v3/` = clean single-modality panels with the 3DPS-routed SFCW and UWB heads (OCTONET_PANELS_TAG=v3): SFCW 0.629 / image corr 0.53, UWB 0.574 / 0.46, WiFi 0.080 / 0.94.
 - 10-29: gains in the grid fits (SFCW image corr 0.41 → 0.51–0.54 at 400 steps; convergence rule fixed to patience-on-best), UWB head routed through the rasterizer (T24), scaffold v2 (T25), yaw re-test still unmeasured (T15).
 - 10-28 (night, 2): T23 done: SFCW head routed through the 3DPS rasterizer; profile corr 0.964 / 0.81 dB. Findings checklist `docs/findings/sfcw_head_vs_3dps.md`.
 - 10-28 (late, 2): T22 SFCW diagnosis, then the AUDIT (user's correction): the head bypassed the 3DPS rasterizer; the real `render_factorized` gives +0.64 at iteration 0. T23 = route the head through it.
