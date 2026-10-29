@@ -6,41 +6,41 @@ Each band is fitted ALONE (its own target only) with the voxel-grid ITU material
 
 | band | loss iter 0 | loss trained (tight, 3 seeds) | loss trained (loose, 1 seed) | dB RMSE iter 0 → trained | corr iter 0 → trained | steps / runtime |
 |---|---|---|---|---|---|---|
-| SFCW | 0.879 ± 0.009 | **0.665 ± 0.001** | 0.643 | 9.70 ± 0.09 → **7.55 ± 0.01** | 0.118 ± 0.014 → **0.411 ± 0.003** | 400 ± 0 / 19 ± 0 s |
-| UWB | 1.184 ± 0.018 | **0.516 ± 0.039** | 0.573 | 12.97 ± 0.04 → **6.71 ± 0.38** | -0.089 ± 0.014 → **0.525 ± 0.058** | 400 ± 0 / 5 ± 0 s |
+| SFCW | 0.881 ± 0.009 | **0.629 ± 0.010** | 0.645 | 9.72 ± 0.10 → **7.22 ± 0.11** | 0.120 ± 0.013 → **0.524 ± 0.012** | 400 ± 0 / 19 ± 0 s |
+| UWB | 0.960 ± 0.013 | **0.569 ± 0.040** | 0.594 | 11.21 ± 0.45 → **7.90 ± 0.84** | 0.148 ± 0.087 → **0.467 ± 0.108** | 400 ± 0 / 5 ± 0 s |
 | WIFI | 0.327 ± 0.010 | **0.098 ± 0.017** | 0.159 | 3.89 ± 0.33 → **1.32 ± 0.38** | -0.070 ± 0.044 → **0.866 ± 0.085** | 251 ± 106 / 6 ± 3 s |
 
 ## SFCW
 
-Best tight seed: `sfcw_tight_s1` (loss 0.6636). Figures: `sfcw_gt_iter0_trained.png`, `sfcw_material.png`.
+Best tight seed: `sfcw_tight_s2` (loss 0.6150). Figures: `sfcw_gt_iter0_trained.png`, `sfcw_material.png`.
 
-| run | loss iter0 → trained | dB RMSE (pairs × bins) | image corr | per-pair corr (median) | pair-mean profile corr / RMSE dB |
-|---|---|---|---|---|---|
-| sfcw_loose_s0 | 0.8736 → 0.6427 | 9.64 → 7.33 | 0.136 → 0.450 | 0.168 → 0.394 | 0.664 → 0.968 / 2.82 → 0.78 |
-| sfcw_tight_s0 | 0.8736 → 0.6664 | 9.64 → 7.57 | 0.136 → 0.409 | 0.168 → 0.365 | 0.664 → 0.964 / 2.82 → 0.82 |
-| sfcw_tight_s1 | 0.8917 → 0.6636 | 9.83 → 7.54 | 0.103 → 0.415 | 0.145 → 0.377 | 0.594 → 0.966 / 3.09 → 0.80 |
-| sfcw_tight_s2 | 0.8728 → 0.6647 | 9.63 → 7.55 | 0.117 → 0.409 | 0.146 → 0.364 | 0.654 → 0.964 / 2.72 → 0.81 |
+| run | gains | loss iter0 → trained | dB RMSE (pairs × bins) | image corr | per-pair corr (median) | pair-mean profile corr / RMSE dB | gain std tx/rx dB (GT) | gain corr tx / rx / pairs |
+|---|---|---|---|---|---|---|---|---|
+| sfcw_loose_s0 | yes | 0.8765 → 0.6452 | 9.66 → 7.35 | 0.137 → 0.517 | 0.173 → 0.311 | 0.659 → 0.927 / 2.90 → 1.15 | 3.04/2.89 (2.79/2.69) | 0.94 / 0.98 / 0.92 |
+| sfcw_tight_s0 | yes | 0.8736 → 0.6333 | 9.66 → 7.28 | 0.137 → 0.519 | 0.173 → 0.317 | 0.659 → 0.930 / 2.90 → 1.12 | 2.69/2.92 (2.79/2.69) | 0.96 / 0.98 / 0.93 |
+| sfcw_tight_s1 | yes | 0.8941 → 0.6396 | 9.86 → 7.31 | 0.105 → 0.513 | 0.148 → 0.293 | 0.595 → 0.904 / 3.13 → 1.30 | 3.13/3.06 (2.79/2.69) | 0.96 / 0.98 / 0.93 |
+| sfcw_tight_s2 | yes | 0.8746 → 0.6150 | 9.65 → 7.07 | 0.119 → 0.541 | 0.149 → 0.324 | 0.653 → 0.931 / 2.77 → 1.10 | 3.06/2.82 (2.79/2.69) | 0.95 / 0.97 / 0.92 |
 
-SFCW alone: the fit flattens the uniform-concrete render (which was +10 dB too bright at 0.9 m and -7 dB too dark at 3.5 m) onto the GT pair-mean profile within about +-2 dB over 0.9-2.6 m, reproducing the floor-ring dips at 1.5 / 2.0 / 2.2 m. It still under-predicts the rise of the GT beyond 2.6 m (GT +6 dB by 3.5 m, render flat: the far wall sits beyond the 3.71 m unambiguous range and wraps, and the subject spot at 2.9 m is a static chair/person return the scaffold cuts), so the residual reaches -5 dB at 3.5 m. The per-pair image correlation stays low (0.27): the GT image has a strong pair-wise banding (per-element gain differences across the 400 pairs) that the render cannot produce without a per-channel gain calibration, and the per-pair ripple is below the scaffold's fidelity. Loose bounds reach 0.69 vs 0.72 by pushing sigma to 5 S/m on a few voxels.
+SFCW alone (T23 head = the 3DPS rasterizer; D13 per-channel gains fitted): the trained pair-mean profile follows the GT bin for bin over 0.9-3.5 m including the floor-ring dips and the rise beyond 2.6 m (the folded -X wall), profile corr 0.931, RMSE 1.10 dB. The per-pair image correlation is 0.541 (per-pair median 0.324); without gains a pair-blind render is capped at ~0.45 by the GT's fixed per-Tx/per-Rx gain banding (4 dB spread, 92 % additive). The fitted gains have std 3.06/2.82 dB (GT-derived 2.79/2.69) and correlate 0.95/0.97 with the GT's per-Tx/per-Rx pattern (0.92 on the 400-pair pattern). What remains is the per-pair ripple within each profile, which is below the scaffold's fidelity (8-bit depth, 3.9 cm quantisation at lambda 4.6 mm) and the uncalibrated per-element phases, so it is not a target. Loose bounds: see the table.
 
 
-Fitted field (best tight seed) at 65.0 GHz: ε′ median 4.23 [p5 1.22, p95 13.36], σ median 0.973 [p5 0.054, p95 3.943] S/m; nearest ITU class: {'concrete': 13148, 'brick': 1551, 'glass': 209, 'wood': 1243, 'plasterboard': 3440, 'marble': 409}.
+Fitted field (best tight seed) at 65.0 GHz: ε′ median 5.11 [p5 3.16, p95 8.27], σ median 0.197 [p5 0.026, p95 1.027] S/m; nearest ITU class: {'concrete': 5290, 'brick': 6803, 'glass': 652, 'wood': 8, 'plasterboard': 2913, 'marble': 4334}.
 
 ## UWB
 
-Best tight seed: `uwb_tight_s1` (loss 0.4618). Figures: `uwb_gt_iter0_trained.png`, `uwb_material.png`.
+Best tight seed: `uwb_tight_s2` (loss 0.5116). Figures: `uwb_gt_iter0_trained.png`, `uwb_material.png`.
 
 | run | loss iter0 → trained | dB RMSE (masked) | corr all | corr 0.3–4 m | corr 4–9.9 m | RMSE dB 0.3–4 / 4–9.9 m |
 |---|---|---|---|---|---|---|
-| uwb_loose_s0 | 1.1792 → 0.5733 | 12.97 → 7.20 | -0.091 → 0.455 | 0.204 → 0.547 | -0.233 → 0.511 | 12.29 → 7.38 / 13.38 → 7.10 |
-| uwb_tight_s0 | 1.1792 → 0.5532 | 12.97 → 7.10 | -0.091 → 0.464 | 0.204 → 0.551 | -0.233 → 0.526 | 12.29 → 7.27 / 13.38 → 6.99 |
-| uwb_tight_s1 | 1.1645 → 0.4618 | 12.92 → 6.19 | -0.104 → 0.603 | 0.189 → 0.692 | -0.238 → 0.620 | 11.98 → 6.19 / 13.50 → 6.19 |
-| uwb_tight_s2 | 1.2080 → 0.5321 | 13.02 → 6.86 | -0.071 → 0.507 | 0.225 → 0.623 | -0.200 → 0.533 | 12.13 → 6.80 / 13.57 → 6.90 |
+| uwb_loose_s0 | 0.9611 → 0.5935 | 11.41 → 8.50 | 0.121 → 0.392 | -0.014 → 0.356 | 0.172 → 0.403 | 11.75 → 8.40 / 11.16 → 8.53 |
+| uwb_tight_s0 | 0.9611 → 0.5989 | 11.41 → 8.60 | 0.121 → 0.381 | -0.014 → 0.336 | 0.172 → 0.394 | 11.75 → 8.63 / 11.16 → 8.55 |
+| uwb_tight_s1 | 0.9752 → 0.5959 | 11.63 → 8.39 | 0.057 → 0.400 | -0.066 → 0.365 | 0.120 → 0.418 | 12.19 → 8.31 / 11.19 → 8.35 |
+| uwb_tight_s2 | 0.9443 → 0.5116 | 10.58 → 6.71 | 0.265 → 0.619 | 0.094 → 0.530 | 0.361 → 0.666 | 11.76 → 7.07 / 9.72 → 6.43 |
 
 UWB alone: the trained envelope tracks the GT mean level over the whole 0.3-9.9 m span (iter 0 was +15 dB too bright below 1.5 m and -20 dB too dark at 6-7 m), and the 6.3-6.8 m far-wall cluster appears at the right range. The GT's fine structure (20-30 dB interference fades every few cm) is not reproduced, so the correlation saturates near 0.5 and the RMSE at 6.7 dB: that structure needs the scaffold geometry to sub-cm accuracy and the UWB mount pose, both of which are assumed (camera yaw, node marker). The near range (0.3-1.5 m) keeps a +5-10 dB excess: node body returns absent from the scaffold.
 
 
-Fitted field (best tight seed) at 7.0 GHz: ε′ median 1.62 [p5 0.97, p95 16.90], σ median 0.007 [p5 0.001, p95 0.311] S/m; nearest ITU class: {'concrete': 3156, 'brick': 13527, 'glass': 250, 'wood': 799, 'plasterboard': 1013, 'marble': 1255}.
+Fitted field (best tight seed) at 7.0 GHz: ε′ median 4.80 [p5 2.11, p95 8.23], σ median 0.039 [p5 0.003, p95 0.193] S/m; nearest ITU class: {'concrete': 3059, 'brick': 9559, 'glass': 399, 'wood': 457, 'plasterboard': 3497, 'marble': 3029}.
 
 ## WIFI
 

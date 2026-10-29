@@ -1,4 +1,7 @@
-"""octonet_mount_yaw: mount orientation of the Vayyar SFCW radar and the UWB radar on node_1.
+"""DEPRECATED (2026-10-28): this sweep used the pre-T23 point-sum SFCW model (no antenna pattern, no BSDF), which has no
+angle dependence, so its flat result is meaningless. Use preprocessing/octonet_mount_yaw_v2.py (3DPS-routed head).
+
+octonet_mount_yaw: mount orientation of the Vayyar SFCW radar and the UWB radar on node_1.
 
 The cameras are calibrated (octonet_calibrate); the radars on node_1 were given the camera yaw BY
 ASSUMPTION. Here the boresight is swept around the camera yaw (position fixed at the node_1 rigid

@@ -115,3 +115,43 @@ class HannPSFTable:
         psf_i = pi_lo * (1 - f) + pi_hi * f                       # (spread, P)
 
         return psf_r, psf_i
+
+
+class TemplatePSFTable:
+    """PSF lookup table built from a MEASURED real range kernel (UWB: the X4 pulse as received, carrier included).
+
+    Same interface as HannPSFTable (``evaluate(n_frac) -> (psf_real, psf_imag)`` over ``spread`` integer offsets),
+    so rasterizer_factorized Step 5 can splat with it unchanged. The kernel value at bin offset d from the path's
+    fractional bin position is ``template[centre + d]`` (linear interpolation); ``psf_imag`` is zero because the
+    template is the real RF waveform itself -- the carrier phase of a path is then the pulse's own carrier shifted
+    by the path delay, which is exactly what a time shift of the received pulse is. (The caller sets the per-path
+    carrier phase to zero for this kernel: ``Rasterizer.psf_carrier_hz = 0``.)
+    """
+
+    def __init__(self, template, centre: int, n_grid: int = 1024, device: str = 'cuda:0'):
+        t = torch.as_tensor(template, dtype=torch.float32, device=device).reshape(-1)
+        t = t / t.abs().max().clamp(min=1e-30)
+        L = int(t.shape[0]); half = min(centre, L - 1 - centre)
+        self.K = None                                              # not tied to the profile length
+        self.spread = 2 * half + 1
+        self.n_grid = n_grid
+        self.device = device
+        self.template = t; self.centre = int(centre)
+        frac_grid = torch.linspace(0, 1 - 1 / n_grid, n_grid, device=device)      # (n_grid,)
+        dn = torch.arange(-half, half + 1, device=device).float()                  # (spread,)
+        x = self.centre + dn[:, None] - frac_grid[None, :]                        # fractional template index (spread, n_grid)
+        x0 = x.floor(); f = x - x0; i0 = x0.long()
+        inside = (i0 >= 0) & (i0 < L - 1); i0c = i0.clamp(0, L - 2)
+        vals = torch.where(inside, t[i0c] * (1 - f) + t[i0c + 1] * f, torch.zeros_like(f))
+        self.psf_real = vals.contiguous()
+        self.psf_imag = torch.zeros_like(vals).contiguous()
+
+    def evaluate(self, n_frac):
+        idx_f = n_frac * self.n_grid
+        idx_lo = idx_f.long().clamp(0, self.n_grid - 1)
+        idx_hi = (idx_lo + 1).clamp(0, self.n_grid - 1)
+        frac = idx_f - idx_lo.float()
+        f = frac[None, :]
+        psf_r = self.psf_real[:, idx_lo] * (1 - f) + self.psf_real[:, idx_hi] * f
+        psf_i = self.psf_imag[:, idx_lo] * (1 - f) + self.psf_imag[:, idx_hi] * f
+        return psf_r, psf_i

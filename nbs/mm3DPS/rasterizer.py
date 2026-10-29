@@ -180,7 +180,35 @@ class Rasterizer:
         self.modulation_scheme = str(radar_cfg.get('modulation_scheme', 'FMCW')).upper()
         self.geometry_mode = str(radar_cfg.get('geometry_mode', 'monostatic')).lower()
 
-        if self.modulation_scheme == 'SFCW':
+        # Generic PSF/phase hooks (defaults keep FMCW/SFCW bitwise): the carrier frequency used for the per-path
+        # phase in Step 2/3, the range-bin offset added to n_peak in Step 5, and a measured range kernel.
+        self.psf_carrier_hz = None          # None -> center_freq
+        self.range_bin_offset = 0.0
+        self.psf_template = None
+        self.psf_template_centre = 0
+        if self.modulation_scheme == 'UWB':
+            # UWB impulse radar (Novelda X4): the recorded frame is the REAL RF waveform sampled at sample_rate_hz; the
+            # range axis is the sample index (bin = c / (2 fs)), the range kernel is the MEASURED pulse template
+            # (carrier included) and the per-path carrier phase is zero (a path delay is a pure time shift of the
+            # pulse); the on-board delay of the direct coupling is a constant bin offset. Material/BSDF at fc.
+            self.center_freq = float(radar_cfg['carrierFrequency'])
+            self.sample_rate = float(radar_cfg['sample_rate_hz'])
+            self.num_samples = int(radar_cfg['n_bins'])
+            self.K = self.num_samples
+            self.range_res = float(radar_cfg.get('range_res_m', C_LIGHT / (2.0 * self.sample_rate)))
+            self.slope = 0.0
+            self.freq_step = None
+            self.freqs = None
+            self.psf_carrier_hz = 0.0
+            self.range_bin_offset = float(radar_cfg.get('delay_bins', 0.0))
+            tpl = radar_cfg.get('pulse_template', None)
+            if tpl:
+                z = np.load(tpl)
+                self.psf_template = np.asarray(z['t_rf'], dtype=np.float64)
+                self.psf_template_centre = int(z['half_width_bins']) if 'half_width_bins' in z.files else len(self.psf_template) // 2
+            import mm3DPS.bsdf_torch as _bsdf
+            _bsdf.set_frequency(self.center_freq)
+        elif self.modulation_scheme == 'SFCW':
             # Stepped-frequency-continuous-wave (Vayyar): discrete CW tones f_start..f_stop, NO
             # chirp slope. Range compression is an IFFT over the n_freq tones (Step 5 uses the
             # N-point-transform bin spacing c/(2*n_freq*df); the Hann range-PSF is identical to

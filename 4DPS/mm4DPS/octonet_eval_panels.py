@@ -101,14 +101,39 @@ def metrics(band, rend, tnp):
     return {"sfcw": metrics_sfcw, "uwb": metrics_uwb, "wifi": metrics_wifi}[band](rend, tnp[band])
 
 
+DB_PER_LOG = 20.0 / math.log(10.0)          # log-amplitude -> dB
+
+
+def gt_channel_gains(tg):
+    """The GT's per-pair median level (dB, tx-major 20x20) and its additive per-Tx / per-Rx decomposition (D13: 92 % of the
+    4 dB spread is tx + rx). Returns dict(level (20,20), tx (20,), rx (20,)) in dB about the global mean."""
+    m = tg["mask"]; G = db(np.abs(tg["rp_mean"]))[:, m]
+    lvl = np.median(G, 1).reshape(20, 20); lvl = lvl - lvl.mean()
+    return dict(level=lvl, tx=lvl.mean(1), rx=lvl.mean(0))
+
+
+def gain_metrics(gains: dict, tg) -> dict:
+    """Fitted gains vs the GT-derived ones: stds in dB and Pearson correlations (per-Tx, per-Rx, per-pair pattern)."""
+    if not gains or not gains.get("enabled"):
+        return dict(enabled=False)
+    gtx = DB_PER_LOG * np.asarray(gains["tx_log"], float); grx = DB_PER_LOG * np.asarray(gains["rx_log"], float)
+    gtx = gtx - gtx.mean(); grx = grx - grx.mean()
+    ref = gt_channel_gains(tg)
+    fitted_pairs = gtx[:, None] + grx[None, :]
+    return dict(enabled=True, tx_std_db=float(gtx.std()), rx_std_db=float(grx.std()), gt_tx_std_db=float(ref["tx"].std()), gt_rx_std_db=float(ref["rx"].std()),
+                corr_tx=_pearson(gtx, ref["tx"]), corr_rx=_pearson(grx, ref["rx"]), corr_pairs=_pearson(fitted_pairs.ravel(), ref["level"].ravel()),
+                tx_db=gtx.tolist(), rx_db=grx.tolist(), gt_tx_db=ref["tx"].tolist(), gt_rx_db=ref["rx"].tolist())
+
+
 
 NOTES = {
- "sfcw": "SFCW alone: the fit flattens the uniform-concrete render (which was +10 dB too bright at 0.9 m and -7 dB too dark at 3.5 m) onto the GT pair-mean "
-         "profile within about +-2 dB over 0.9-2.6 m, reproducing the floor-ring dips at 1.5 / 2.0 / 2.2 m. It still under-predicts the rise of the GT beyond "
-         "2.6 m (GT +6 dB by 3.5 m, render flat: the far wall sits beyond the 3.71 m unambiguous range and wraps, and the subject spot at 2.9 m is a static "
-         "chair/person return the scaffold cuts), so the residual reaches -5 dB at 3.5 m. The per-pair image correlation stays low (0.27): the GT image has a strong "
-         "pair-wise banding (per-element gain differences across the 400 pairs) that the render cannot produce without a per-channel gain calibration, and the "
-         "per-pair ripple is below the scaffold's fidelity. Loose bounds reach 0.69 vs 0.72 by pushing sigma to 5 S/m on a few voxels.",
+ "sfcw": "SFCW alone (T23 head = the 3DPS rasterizer; D13 per-channel gains {gains_state}): the trained pair-mean profile follows the GT bin for bin over "
+         "0.9-3.5 m including the floor-ring dips and the rise beyond 2.6 m (the folded -X wall), profile corr {profile_corr:.3f}, RMSE {profile_rmse:.2f} dB. "
+         "The per-pair image correlation is {corr_image:.3f} (per-pair median {corr_pair:.3f}); without gains a pair-blind render is capped at ~0.45 by the GT's "
+         "fixed per-Tx/per-Rx gain banding (4 dB spread, 92 % additive). The fitted gains have std {gain_tx:.2f}/{gain_rx:.2f} dB (GT-derived {gt_tx:.2f}/{gt_rx:.2f}) "
+         "and correlate {corr_tx:.2f}/{corr_rx:.2f} with the GT's per-Tx/per-Rx pattern ({corr_pairs:.2f} on the 400-pair pattern). What remains is the per-pair "
+         "ripple within each profile, which is below the scaffold's fidelity (8-bit depth, 3.9 cm quantisation at lambda 4.6 mm) and the uncalibrated per-element "
+         "phases, so it is not a target. Loose bounds: see the table.",
  "uwb": "UWB alone: the trained envelope tracks the GT mean level over the whole 0.3-9.9 m span (iter 0 was +15 dB too bright below 1.5 m and -20 dB too dark at "
         "6-7 m), and the 6.3-6.8 m far-wall cluster appears at the right range. The GT's fine structure (20-30 dB interference fades every few cm) is not "
         "reproduced, so the correlation saturates near 0.5 and the RMSE at 6.7 dB: that structure needs the scaffold geometry to sub-cm accuracy and the UWB "
@@ -128,23 +153,28 @@ def cmd_fit(a):
     for kind, seed in plan:
         B = set_bounds(kind); tag = f"{band}_{kind}_s{seed}"
         print(f"=== {tag}: V={a.voxels} steps={a.steps} bounds={B}", flush=True)
-        res, grid, abcd, cloud, sensors, targets = MB.fit((band,), dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=tag)
+        res, grid, abcd, cloud, sensors, targets = MB.fit((band,), dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=tag, gains=not a.no_gains, gain_l2=a.gain_l2, patience=a.patience)
         tnp = targets_np(targets)
         mat0 = dict(abcd=torch.tensor(ITU_GT["concrete"], dtype=torch.float64, device=dev).expand(cloud["xyz"].shape[0], 4).contiguous(), rho=None)
         mat1 = grid.material_at(cloud["xyz"])
-        r0 = render_all(band, cloud, mat0, sensors, targets); r1 = render_all(band, cloud, mat1, sensors, targets)
+        r0 = render_all(band, cloud, mat0, MB.sensors_without_gains(sensors), targets); r1 = render_all(band, cloud, mat1, sensors, targets)
         m0 = metrics(band, r0, tnp); m1 = metrics(band, r1, tnp)
+        gm = gain_metrics(res.get("gains"), tnp["sfcw"]) if band == "sfcw" else dict(enabled=False)
         res = dict(res); res.update(bounds=kind, bounds_values={k: (list(v) if isinstance(v, tuple) else v) for k, v in B.items()}, metrics_iter0=m0, metrics_trained=m1,
-                   dispersion=MB.dispersion_summary(abcd), loss_iter0=res["start"][band], loss_trained=res["end"][band])
+                   dispersion=MB.dispersion_summary(abcd), loss_iter0=res["start"][band], loss_trained=res["end"][band], gain_metrics=gm)
         res.pop("log", None)
         json.dump(res, open(os.path.join(OUT, tag + ".json"), "w"), indent=1)
         save = dict(xyz=cloud["xyz"].cpu().numpy(), abcd=abcd)
+        if gm.get("enabled"):
+            save.update(gain_tx_db=np.asarray(gm["tx_db"]), gain_rx_db=np.asarray(gm["rx_db"]), gt_gain_tx_db=np.asarray(gm["gt_tx_db"]), gt_gain_rx_db=np.asarray(gm["gt_rx_db"]))
         if band == "wifi":
             for k in (1, 2, 3, 4): save[f"r0_{k}"] = r0[k]; save[f"r1_{k}"] = r1[k]
         else:
             save["r0"] = r0; save["r1"] = r1
         np.savez(os.path.join(OUT, tag + ".npz"), **save)
         print(f"  {tag}: loss {res['loss_iter0']:.4f} -> {res['loss_trained']:.4f} | {json.dumps(m1)[:300]}", flush=True)
+        if gm.get("enabled"):
+            print(f"  {tag}: gains tx/rx std {gm['tx_std_db']:.2f}/{gm['rx_std_db']:.2f} dB (GT {gm['gt_tx_std_db']:.2f}/{gm['gt_rx_std_db']:.2f}); corr tx {gm['corr_tx']:.3f} rx {gm['corr_rx']:.3f} pairs {gm['corr_pairs']:.3f}", flush=True)
 
 
 # ----------------------------------------------------------------------------- figures + tables
@@ -226,6 +256,22 @@ def fig_wifi(tnp, z, tag, path):
     fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
+def fig_gains(tnp, z, run, tag, path):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    g = run["gain_metrics"]; ref = gt_channel_gains(tnp["sfcw"])
+    ftx, frx = np.asarray(g["tx_db"]), np.asarray(g["rx_db"])
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5.2))
+    for a, f, r, nm in ((ax[0], ftx, ref["tx"], "Tx"), (ax[1], frx, ref["rx"], "Rx")):
+        a.plot(r, "k.-", label=f"GT-derived (per-pair median level, {nm} mean)"); a.plot(f, "C3.-", label="fitted (log-amplitude gain, dB)")
+        a.set_xlabel(f"{nm} index (tx-major pair order)"); a.set_ylabel("gain [dB] about the mean"); a.grid(alpha=.3); a.legend(fontsize=8)
+        a.set_title(f"per-{nm} channel gain: fitted std {f.std():.2f} dB vs GT {r.std():.2f} dB, corr {_pearson(f, r):.2f}")
+    fp = (ftx[:, None] + frx[None, :]).ravel(); gp = ref["level"].ravel()
+    ax[2].scatter(gp, fp, s=8, alpha=.6); lim = [min(gp.min(), fp.min()) - .5, max(gp.max(), fp.max()) + .5]; ax[2].plot(lim, lim, "k--", lw=.8)
+    ax[2].set_xlabel("GT per-pair median level [dB]"); ax[2].set_ylabel("fitted tx + rx gain [dB]"); ax[2].grid(alpha=.3)
+    ax[2].set_title(f"400-pair gain pattern: corr {_pearson(fp, gp):.2f} (GT pattern is 92 % additive tx+rx)")
+    fig.suptitle(f"SFCW per-channel gains (D13), run {tag}: L2 {run['gains'].get('l2', 0):g} on the log-amplitudes", fontsize=12); fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+
+
 def fig_material(band, z, run, tag, path):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     f = MB.BAND_FC_GHZ[band]; abcd = z["abcd"]; xyz = z["xyz"]
@@ -270,10 +316,11 @@ def cmd_figures(a):
         README += [f"## {band.upper()}", "", f"Best tight seed: `{bt}` (loss {run['loss_trained']:.4f}). Figures: `{band}_gt_iter0_trained.png`, `{band}_material.png`.", ""]
         # per-band table
         if band == "sfcw":
-            README += ["| run | loss iter0 → trained | dB RMSE (pairs × bins) | image corr | per-pair corr (median) | pair-mean profile corr / RMSE dB |", "|---|---|---|---|---|---|"]
+            README += ["| run | gains | loss iter0 → trained | dB RMSE (pairs × bins) | image corr | per-pair corr (median) | pair-mean profile corr / RMSE dB | gain std tx/rx dB (GT) | gain corr tx / rx / pairs |", "|---|---|---|---|---|---|---|---|---|"]
             for k, v in runs.items():
-                a, b = v["metrics_iter0"], v["metrics_trained"]
-                README.append(f"| {k} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['rmse_db']:.2f} → {b['rmse_db']:.2f} | {a['corr_image']:.3f} → {b['corr_image']:.3f} | {a['corr_pair_median']:.3f} → {b['corr_pair_median']:.3f} | {a['corr_pair_mean_profile']:.3f} → {b['corr_pair_mean_profile']:.3f} / {a['rmse_db_pair_mean_profile']:.2f} → {b['rmse_db_pair_mean_profile']:.2f} |")
+                a, b = v["metrics_iter0"], v["metrics_trained"]; g = v.get("gain_metrics", {}) or {}
+                gcell = (f"{g['tx_std_db']:.2f}/{g['rx_std_db']:.2f} ({g['gt_tx_std_db']:.2f}/{g['gt_rx_std_db']:.2f}) | {g['corr_tx']:.2f} / {g['corr_rx']:.2f} / {g['corr_pairs']:.2f}" if g.get("enabled") else "— | —")
+                README.append(f"| {k} | {'yes' if g.get('enabled') else 'no'} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['rmse_db']:.2f} → {b['rmse_db']:.2f} | {a['corr_image']:.3f} → {b['corr_image']:.3f} | {a['corr_pair_median']:.3f} → {b['corr_pair_median']:.3f} | {a['corr_pair_mean_profile']:.3f} → {b['corr_pair_mean_profile']:.3f} / {a['rmse_db_pair_mean_profile']:.2f} → {b['rmse_db_pair_mean_profile']:.2f} | {gcell} |")
         elif band == "uwb":
             README += ["| run | loss iter0 → trained | dB RMSE (masked) | corr all | corr 0.3–4 m | corr 4–9.9 m | RMSE dB 0.3–4 / 4–9.9 m |", "|---|---|---|---|---|---|---|"]
             for k, v in runs.items():
@@ -286,12 +333,22 @@ def cmd_figures(a):
                 cells = " | ".join(f"{a[f'rx{i}']['rmse_db']:.2f}→{b[f'rx{i}']['rmse_db']:.2f} / {a[f'rx{i}']['corr']:.2f}→{b[f'rx{i}']['corr']:.2f}" for i in (1, 2, 3, 4))
                 README.append(f"| {k} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['all']['rmse_db']:.2f} → {b['all']['rmse_db']:.2f} | {a['all']['corr']:.3f} → {b['all']['corr']:.3f} | {cells} |")
         d = run["dispersion"]; f = MB.BAND_FC_GHZ[band]; dd = d[f"{f}GHz"]
-        README += ["", NOTES[band], ""]
+        note = NOTES[band]
+        if band == "sfcw":
+            mt = run["metrics_trained"]; g = run.get("gain_metrics", {}) or {}
+            fill = dict(gains_state="fitted" if g.get("enabled") else "OFF", profile_corr=mt["corr_pair_mean_profile"], profile_rmse=mt["rmse_db_pair_mean_profile"],
+                        corr_image=mt["corr_image"], corr_pair=mt["corr_pair_median"],
+                        **{k: g.get(k2, float("nan")) for k, k2 in (("gain_tx", "tx_std_db"), ("gain_rx", "rx_std_db"), ("gt_tx", "gt_tx_std_db"), ("gt_rx", "gt_rx_std_db"), ("corr_tx", "corr_tx"), ("corr_rx", "corr_rx"), ("corr_pairs", "corr_pairs"))})
+            note = note.format(**fill)
+        README += ["", note, ""]
         README += ["", f"Fitted field (best tight seed) at {f} GHz: ε′ median {dd['eps_median']:.2f} [p5 {dd['eps_p05']:.2f}, p95 {dd['eps_p95']:.2f}], σ median {dd['sigma_median']:.3f} [p5 {dd['sigma_p05']:.3f}, p95 {dd['sigma_p95']:.3f}] S/m; "
                    f"nearest ITU class: {d['nearest_itu_class']}.", ""]
         if band == "sfcw":
             fig_sfcw(tnp, z, bt, os.path.join(VIZ, "sfcw_gt_iter0_trained.png"))
-            captions.append("sfcw_gt_iter0_trained.png: SFCW pair-wise |range profile| (dB, median-normalised, bins 0.9-3.5 m) and the pair-mean profile: GT pooled target vs rendered at iter 0 (uniform concrete) vs trained (SFCW alone, tight bounds); last column = residual.")
+            captions.append("sfcw_gt_iter0_trained.png: SFCW pair-wise |range profile| (dB, median-normalised, bins 0.9-3.5 m) and the pair-mean profile: GT pooled target vs rendered at iter 0 (uniform concrete) vs trained (SFCW alone, tight bounds, 3DPS head + per-channel gains); last column = residual.")
+            if run.get("gain_metrics", {}).get("enabled"):
+                fig_gains(tnp, z, run, bt, os.path.join(VIZ, "sfcw_gains.png"))
+                captions.append("sfcw_gains.png: the fitted 20 per-Tx and 20 per-Rx log-amplitude gains (dB) of the SFCW-alone fit vs the gains implied by the GT's per-pair median levels (additive tx + rx decomposition), and the 400-pair gain pattern fitted vs GT.")
         elif band == "uwb":
             fig_uwb(tnp, z, bt, os.path.join(VIZ, "uwb_gt_iter0_trained.png"))
             captions.append("uwb_gt_iter0_trained.png: UWB log-envelope (0.3-9.9 m and 0.3-4 m zoom): GT pooled vs rendered iter 0 vs trained (UWB alone); measured pulse template, on-board delay removed; last column = residual.")
@@ -316,6 +373,9 @@ def main(argv=None):
     f = sub.add_parser("fit"); f.add_argument("--band", required=True, choices=BANDS); f.add_argument("--seeds", default="0,1,2"); f.add_argument("--loose", action="store_true")
     f.add_argument("--points", type=int, default=20000); f.add_argument("--steps", type=int, default=400); f.add_argument("--lr", type=float, default=0.03)
     f.add_argument("--voxels", type=int, default=64); f.add_argument("--tv", type=float, default=1e-3); f.add_argument("--device", default="cuda")
+    f.add_argument("--no-gains", action="store_true", help="SFCW: do not fit the 20+20 per-channel gains (pre-D13 behaviour)")
+    f.add_argument("--gain-l2", type=float, default=0.01, help="L2 weight on the SFCW log-amplitude channel gains")
+    f.add_argument("--patience", type=int, default=0, help="stop when the best loss has not improved for N steps (0 = run all --steps; the panels use all steps)")
     sub.add_parser("figures")
     a = ap.parse_args(argv)
     {"fit": cmd_fit, "figures": cmd_figures}[a.cmd](a)

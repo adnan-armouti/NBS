@@ -146,7 +146,7 @@ class OctoNetSequence:
 
 # --------------------------------------------------------------------------- render inputs (the heads' convention)
 def render_inputs(scaffold_dir: Path, extrinsics: dict | Path, device="cuda", n_points: int | None = None,
-                  seed: int = 0, material_rho: float = 1.0) -> tuple[dict, dict, dict]:
+                  seed: int = 0, material_rho: float = 1.0, use_shadow_mask: bool | None = None) -> tuple[dict, dict, dict]:
     """``(cloud, material, sensor)`` for mm4DPS.octonet_heads from a scaffold-stage directory.
 
     cloud    = {xyz (N,3) float64, normals (N,3) float64}            MoCap world, metres
@@ -157,10 +157,19 @@ def render_inputs(scaffold_dir: Path, extrinsics: dict | Path, device="cuda", n_
     from mm4DPS.octonet_heads import sensor_from_extrinsics
     from method import freq_material as FM
     pcl = np.load(Path(scaffold_dir) / "pcl.npy").astype(np.float64)
+    sm_path = Path(scaffold_dir) / "shadow_mask.npy"
+    # D7: the mask is written by the stage but consumed only on request -- at iteration 0 it did not help the SFCW
+    # profile (0.636 -> 0.614 with 0.25 deg cells / 0.15 m; the bin < 0.9 m guard already removes the node's own body)
+    if use_shadow_mask is None:
+        use_shadow_mask = os.environ.get("OCTONET_SHADOW_MASK", "0") == "1"
+    shadow = np.load(sm_path) if (use_shadow_mask and sm_path.exists()) else None
     if n_points and len(pcl) > n_points:
-        pcl = pcl[np.random.default_rng(seed).choice(len(pcl), n_points, replace=False)]
+        idx = np.random.default_rng(seed).choice(len(pcl), n_points, replace=False)
+        pcl = pcl[idx]; shadow = None if shadow is None else shadow[idx]
     cloud = {"xyz": torch.as_tensor(pcl[:, :3], dtype=torch.float64, device=device),
              "normals": torch.as_tensor(pcl[:, 3:6], dtype=torch.float64, device=device)}
+    if shadow is not None:
+        cloud["shadow_mask"] = torch.as_tensor(shadow, dtype=torch.bool, device=device)      # D7: True = visible from the radar
     abcd = FM.ITU_MATERIALS["concrete"] if hasattr(FM, "ITU_MATERIALS") else (5.24, 0.0, 0.0462, 0.7822)
     material = {"abcd": torch.as_tensor(np.tile(np.asarray(abcd, float), (len(pcl), 1)), dtype=torch.float64, device=device),
                 "rho": torch.full((len(pcl),), float(material_rho), dtype=torch.float64, device=device)}
@@ -189,23 +198,46 @@ def run_octonet_scaffold(args: argparse.Namespace) -> dict:
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     device = args.device
     clouds, sources, cams = [], [], {}
+    normals_mode = getattr(args, "normals", "planar")
     for n in CAM_NODES:
         med, sel = median_depth(n, args.rec, args.frames)
-        pts_cam = S.backproject(med, stride=args.stride)
         R, t, src = S.camera_pose(n)
-        w = pts_cam @ R.T + t
+        if normals_mode == "planar":
+            # D16: robust local plane fits on the full-resolution median depth, normals carried per point, voxel-averaged
+            from mm4DPS.octonet_geometry import planar_normals_depth, backproject_with_normals, voxel_average
+            K = S.d455_nominal_intrinsics()
+            nmap, okmap = planar_normals_depth(med, K, r=args.plane_radius, step_m=10.0 / 255.0 * S.depth_scale(n), device=device)
+            pts_cam, n_cam = backproject_with_normals(med, nmap, okmap, K, stride=args.stride)
+            w = pts_cam @ R.T + t; n_w = n_cam @ R.T
+        else:
+            pts_cam = S.backproject(med, stride=args.stride)
+            w = pts_cam @ R.T + t; n_w = None
         r = np.hypot(w[:, 0], w[:, 1])
         person = (r < args.person_radius) & (w[:, 2] > 0.0) & (w[:, 2] < args.person_zmax)
         keep = (~person) & (w[:, 2] > -0.1) & (w[:, 2] < args.z_max)
         w = w[keep]
-        # per-camera voxel + normals on the device (4DPS's own routines, oriented toward that camera)
-        cloud = voxel_downsample_torch(torch.as_tensor(w, dtype=torch.float64, device=device), args.voxel_m)
-        normals = pca_normals_torch(cloud, max(0.15, args.voxel_m * 4), 40, torch.as_tensor(t, dtype=torch.float64, device=device))
-        clouds.append(torch.cat([cloud.float(), normals.float()], 1).cpu().numpy()); sources.append(np.full(len(cloud), n, dtype=np.int8))
+        if normals_mode == "planar":
+            cloud_np, normals_np = voxel_average(w, n_w[keep], args.voxel_m)
+            clouds.append(np.concatenate([cloud_np, normals_np], 1).astype(np.float32)); n_kept = len(cloud_np)
+        else:
+            # per-camera voxel + PCA normals on the device (4DPS's own routines, oriented toward that camera)
+            cloud = voxel_downsample_torch(torch.as_tensor(w, dtype=torch.float64, device=device), args.voxel_m)
+            normals = pca_normals_torch(cloud, max(0.15, args.voxel_m * 4), 40, torch.as_tensor(t, dtype=torch.float64, device=device))
+            clouds.append(torch.cat([cloud.float(), normals.float()], 1).cpu().numpy()); n_kept = len(cloud)
+        sources.append(np.full(n_kept, n, dtype=np.int8))
         cams[f"node_{n}"] = {"frames": sel, "R_wc": R.tolist(), "t_w": t.tolist(), "pose_source": src,
-                             "depth_scale": S.depth_scale(n), "points_kept": int(len(cloud))}
+                             "depth_scale": S.depth_scale(n), "points_kept": int(n_kept), "normals": normals_mode}
     pcl = np.concatenate(clouds); src = np.concatenate(sources)
     np.save(out / "pcl.npy", pcl); np.save(out / "source_node.npy", src)
+    shadow_meta = None
+    if getattr(args, "shadow_mask", True):
+        # D7: depth-buffer visibility from the Vayyar (the point-scaffold stand-in for 3DPS's mesh ray cast)
+        from mm4DPS.octonet_geometry import visibility_mask
+        R_v0, t_v0 = seq.sensor_pose("vayyar")
+        vis = visibility_mask(pcl[:, :3], np.asarray(t_v0, float), np.asarray(R_v0)[:, 2], cell_deg=args.shadow_cell_deg, tol_m=args.shadow_tol_m)
+        np.save(out / "shadow_mask.npy", vis)
+        shadow_meta = {"visible_fraction": float(vis.mean()), "cell_deg": args.shadow_cell_deg, "tol_m": args.shadow_tol_m,
+                       "method": "nearest point per (az, el) cell from the Vayyar within tol; back hemisphere occluded", "file": "shadow_mask.npy (True = visible)"}
     # the measured static target (pooled over Scene-1 recordings when available)
     target = seq.static_target(pooled=True)
     rp = np.asarray(target["rp_mean"]).astype(np.complex64)
@@ -224,6 +256,7 @@ def run_octonet_scaffold(args: argparse.Namespace) -> dict:
                         "nbs/method/sfcw_target.py; weights in vayyar_static_target.npz",
         "vayyar_pose": {"R_wc": R_v.tolist(), "t_w": t_v.tolist(), "assumption": "camera yaw, level, at the node_1 marker"},
         "sensors": {k: asdict(v) for k, v in SENSORS.items()},
+        "normals": normals_mode, "shadow_mask": shadow_meta,
     }
     (out / "scaffold_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     return metadata
@@ -237,6 +270,10 @@ def main_scaffold(argv=None) -> int:
     p.add_argument("--voxel-m", type=float, default=0.05); p.add_argument("--person-radius", type=float, default=0.7)
     p.add_argument("--person-zmax", type=float, default=2.2); p.add_argument("--z-max", type=float, default=3.0)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--normals", choices=("planar", "pca"), default="planar", help="planar = robust plane fits on the full-res depth (D16); pca = the v1 voxel-cloud PCA")
+    p.add_argument("--plane-radius", type=int, default=12, help="half window (px) of the plane fit (12 = 25 px; r=7 scored worse at iteration 0)")
+    p.add_argument("--shadow-mask", dest="shadow_mask", action="store_true", default=True); p.add_argument("--no-shadow-mask", dest="shadow_mask", action="store_false")
+    p.add_argument("--shadow-cell-deg", type=float, default=0.25); p.add_argument("--shadow-tol-m", type=float, default=0.15)
     args = p.parse_args(argv)
     meta = run_octonet_scaffold(args)
     print(json.dumps({k: meta[k] for k in ("recording", "point_count", "cameras")}, indent=1))

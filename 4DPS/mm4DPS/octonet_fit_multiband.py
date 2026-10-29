@@ -29,6 +29,8 @@ from preprocessing import octonet_config as C, octonet_scene as S
 
 DATA_OUT = os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT)
 OUT = os.path.join(DATA_OUT, "fit_S1_multiband")
+# default scaffold: v1 (voxel PCA normals). v2 (planar normals, D16) is available via OCTONET_SCAFFOLD_DIR but trains WORSE
+# without gains (0.735 vs 0.665) and equal within seed noise with gains (2026-10-29 A/B), so it is not the default.
 SCAFFOLD_DIR = os.environ.get("OCTONET_SCAFFOLD_DIR", os.path.join(DATA_OUT, "4dps_scaffold_S1"))
 EXTRINSICS = os.path.join(DATA_OUT, "calib_S1", "extrinsics.json")
 BANDS = ("sfcw", "uwb", "wifi")
@@ -115,6 +117,17 @@ def hilbert_env(x: torch.Tensor) -> torch.Tensor:
     return torch.fft.ifft(X * h).abs()
 
 
+def sensors_with_gains(sensors: dict, g_tx, g_rx) -> dict:
+    """Copy of ``sensors`` whose Vayyar entry carries the linear per-channel gains exp(g_tx), exp(g_rx) (D13)."""
+    out = dict(sensors); v = dict(sensors["vayyar"]); v["gain_tx"] = torch.exp(g_tx); v["gain_rx"] = torch.exp(g_rx); out["vayyar"] = v
+    return out
+
+
+def sensors_without_gains(sensors: dict) -> dict:
+    out = dict(sensors); out["vayyar"] = {k: v for k, v in sensors["vayyar"].items() if k not in ("gain_tx", "gain_rx")}
+    return out
+
+
 def wifi_sensor():
     return dict(tx=S.WIFI_TX_APPROX, rx={k: S.WIFI_RX_APPROX[k] for k in (1, 2, 3, 4)}, los={1: True, 2: True, 3: True, 4: False})
 
@@ -159,37 +172,62 @@ def evaluate(bands, cloud, material, sensors, targets):
         return {b: band_loss(b, cloud, material, sensors, targets)[0].item() for b in bands}
 
 
-def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed=0, tag=None, verbose=True):
+def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed=0, tag=None, verbose=True, gains=True, gain_l2=0.01, patience=60):
+    """Fit the voxel-grid ITU field on ``bands``. For the SFCW band, ``gains`` adds the 20 + 20 learnable log-amplitude
+    per-channel gains of the raw Vayyar phasors (D13; init 0, same Adam, L2 ``gain_l2``); the median normalisation of the
+    loss removes the global scale, so the L2 only pins the per-channel spread. The returned ``sensors['vayyar']`` carries
+    the fitted linear gains (``gain_tx``/``gain_rx``); ``sensors_without_gains`` strips them for an iteration-0 render."""
     cloud, material0, sensors = setup(dev, n_points, seed)
+    sensors = sensors_without_gains(sensors)
     targets = load_targets(dev)
     grid = VoxelGridMaterial(cloud["xyz"], voxels=voxels).to(dev)
-    opt = torch.optim.Adam(grid.parameters(), lr=lr)
-    # start losses (uniform concrete == the grid's init up to noise) on ALL bands for the gate
+    use_gains = bool(gains) and ("sfcw" in bands)
+    g_tx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=use_gains)
+    g_rx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=use_gains)
+    params = [{"params": list(grid.parameters()), "lr": lr}] + ([{"params": [g_tx, g_rx], "lr": lr}] if use_gains else [])
+    opt = torch.optim.Adam(params)
+    # start losses (uniform concrete == the grid's init up to noise, gains = 1) on ALL bands for the gate
     mat0 = dict(abcd=material0["abcd"], rho=None)
     start_all = evaluate(BANDS, cloud, mat0, sensors, targets)
     w = {b: 1.0 / max(start_all[b], 1e-6) for b in bands}
-    log = []; t0 = time.time(); best = (float("inf"), None, 0)
+    log = []; t0 = time.time(); best = (float("inf"), None, 0, None)
+    best_hist = []
     for step in range(1, steps + 1):
         opt.zero_grad(set_to_none=True)
         mat = grid.material_at(cloud["xyz"])
-        parts = {b: band_loss(b, cloud, mat, sensors, targets)[0] for b in bands}
-        total = sum(w[b] * parts[b] for b in bands) + tv * grid.tv()
+        sens = sensors_with_gains(sensors, g_tx, g_rx) if use_gains else sensors
+        parts = {b: band_loss(b, cloud, mat, sens, targets)[0] for b in bands}
+        reg_g = gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean()) if use_gains else 0.0
+        total = sum(w[b] * parts[b] for b in bands) + tv * grid.tv() + reg_g
         total.backward(); opt.step()
-        rec = dict(step=step, total=float(total), **{b: float(parts[b]) for b in bands}, t=time.time() - t0); log.append(rec)
+        rec = dict(step=step, total=float(total), **{b: float(parts[b]) for b in bands}, t=time.time() - t0)
+        if use_gains: rec["gain_tx_std"] = float(g_tx.std()); rec["gain_rx_std"] = float(g_rx.std())
+        log.append(rec)
         if float(total) < best[0]:
-            best = (float(total), {k: v.detach().clone() for k, v in grid.state_dict().items()}, step)
+            best = (float(total), {k: v.detach().clone() for k, v in grid.state_dict().items()}, step, (g_tx.detach().clone(), g_rx.detach().clone()))
         if verbose and (step % 25 == 0 or step == 1):
-            print(f"  [{tag or ','.join(bands)}] step {step:4d} total {float(total):.4f} " + " ".join(f"{b} {float(parts[b]):.4f}" for b in bands) + f" {time.time()-t0:.0f} s", flush=True)
-        if step >= 80 and abs(log[-1]["total"] - log[-41]["total"]) < 2e-4:
+            print(f"  [{tag or ','.join(bands)}] step {step:4d} total {float(total):.4f} " + " ".join(f"{b} {float(parts[b]):.4f}" for b in bands)
+                  + (f" gains tx/rx std {float(g_tx.std()):.3f}/{float(g_rx.std()):.3f}" if use_gains else "") + f" {time.time()-t0:.0f} s", flush=True)
+        # convergence = the BEST total has not improved by 2e-4 for 60 steps (a plain difference test fired on a
+        # bouncing loss at ~100 steps and left 0.08 of loss on the table, 2026-10-29); minimum 150 steps
+        best_hist.append(min(best_hist[-1], log[-1]["total"]) if best_hist else log[-1]["total"])
+        pat = int(patience) if patience is not None else 60
+        if pat > 0 and step >= max(150, pat + 1) and best_hist[-1] > best_hist[-(pat + 1)] - 2e-4:
             if verbose: print("  converged", flush=True)
             break
     grid.load_state_dict(best[1])
+    if use_gains:
+        g_tx, g_rx = best[3]
+        sensors = sensors_with_gains(sensors, g_tx, g_rx)                     # the fitted gains ride with the sensors
     with torch.no_grad():
         mat = grid.material_at(cloud["xyz"])
         end_all = evaluate(BANDS, cloud, mat, sensors, targets)
         abcd = mat["abcd"].cpu().numpy()
     res = dict(bands=list(bands), seed=seed, points=int(cloud["xyz"].shape[0]), voxels=voxels, voxel_m=grid.voxel_m, steps=len(log), best_step=best[2],
-               start=start_all, end=end_all, log=log, runtime_s=time.time() - t0)
+               start=start_all, end=end_all, log=log, runtime_s=time.time() - t0,
+               gains=(dict(enabled=True, l2=gain_l2, tx_log=g_tx.detach().cpu().numpy().tolist(), rx_log=g_rx.detach().cpu().numpy().tolist(),
+                           tx_std_db=float(20 / math.log(10) * g_tx.detach().std()), rx_std_db=float(20 / math.log(10) * g_rx.detach().std()))
+                      if use_gains else dict(enabled=False)))
     return res, grid, abcd, cloud, sensors, targets
 
 
@@ -215,23 +253,26 @@ def save_run(name, res, grid, abcd, cloud, extra=None):
     os.makedirs(OUT, exist_ok=True)
     res = dict(res); res["dispersion"] = dispersion_summary(abcd); res.update(extra or {})
     json.dump(res, open(os.path.join(OUT, f"{name}.json"), "w"), indent=1)
+    g = res.get("gains", {}) or {}
     np.savez(os.path.join(OUT, f"{name}_material.npz"), xyz=cloud["xyz"].cpu().numpy(), abcd=abcd, grid=grid.grid.detach().cpu().numpy(),
-             lo=grid.lo.cpu().numpy(), hi=grid.hi.cpu().numpy())
+             lo=grid.lo.cpu().numpy(), hi=grid.hi.cpu().numpy(),
+             gain_tx_log=np.asarray(g.get("tx_log", np.zeros(20)), float), gain_rx_log=np.asarray(g.get("rx_log", np.zeros(20)), float))
     return res
 
 
 # ----------------------------------------------------------------------------- commands
 def cmd_run(a):
     dev = torch.device(a.device); bands = tuple(a.bands.split(","))
-    res, grid, abcd, cloud, sensors, targets = fit(bands, dev, a.points, a.steps, a.lr, a.voxels, a.tv, a.seed, tag=a.tag)
+    res, grid, abcd, cloud, sensors, targets = fit(bands, dev, a.points, a.steps, a.lr, a.voxels, a.tv, a.seed, tag=a.tag, gains=not a.no_gains, gain_l2=a.gain_l2)
     name = a.tag or ("run_" + "_".join(bands) + f"_s{a.seed}")
+    sensors0 = sensors_without_gains(sensors)
     # rendered quantities before/after for the figure
     with torch.no_grad():
         mat0 = dict(abcd=torch.tensor(ITU_GT["concrete"], dtype=torch.float64, device=dev).expand(cloud["xyz"].shape[0], 4).contiguous(), rho=None)
         mat1 = grid.material_at(cloud["xyz"])
         rend = {}
         for b in BANDS:
-            _, r0 = band_loss(b, cloud, mat0, sensors, targets); _, r1 = band_loss(b, cloud, mat1, sensors, targets)
+            _, r0 = band_loss(b, cloud, mat0, sensors0, targets); _, r1 = band_loss(b, cloud, mat1, sensors, targets)
             if b == "sfcw":
                 rend["sfcw_before"] = r0["rp"].abs().mean(0).cpu().numpy(); rend["sfcw_after"] = r1["rp"].abs().mean(0).cpu().numpy()
             elif b == "uwb":
@@ -248,7 +289,7 @@ def cmd_run(a):
 def cmd_gate(a):
     dev = torch.device(a.device); held = a.held; train = tuple(b for b in BANDS if b != held)
     for seed in [int(s) for s in a.seeds.split(",")]:
-        res, grid, abcd, cloud, sensors, targets = fit(train, dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=f"gate_{held}_s{seed}")
+        res, grid, abcd, cloud, sensors, targets = fit(train, dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=f"gate_{held}_s{seed}", gains=not a.no_gains, gain_l2=a.gain_l2)
         res = save_run(f"gate_held_{held}_s{seed}", res, grid, abcd, cloud, dict(held=held, held_start=res["start"][held], held_end=res["end"][held]))
         print(f"gate held={held} seed={seed}: uniform concrete {res['held_start']:.4f} -> two-band fit {res['held_end']:.4f}  (train: " + " ".join(f"{b} {res['start'][b]:.3f}->{res['end'][b]:.3f}" for b in train) + ")")
 
@@ -369,6 +410,8 @@ def main(argv=None):
     def common(p):
         p.add_argument("--points", type=int, default=20000); p.add_argument("--steps", type=int, default=250); p.add_argument("--lr", type=float, default=0.03)
         p.add_argument("--voxels", type=int, default=28); p.add_argument("--tv", type=float, default=1e-3); p.add_argument("--device", default="cuda")
+        p.add_argument("--no-gains", action="store_true", help="SFCW: do not fit the 20+20 per-channel gains (pre-D13 behaviour)")
+        p.add_argument("--gain-l2", type=float, default=0.01, help="L2 weight on the SFCW log-amplitude channel gains")
     r = sub.add_parser("run"); common(r); r.add_argument("--bands", default="sfcw,uwb,wifi"); r.add_argument("--seed", type=int, default=0); r.add_argument("--tag", default=None)
     g = sub.add_parser("gate"); common(g); g.add_argument("--held", required=True, choices=BANDS); g.add_argument("--seeds", default="0,1,2")
     sub.add_parser("report")

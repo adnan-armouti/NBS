@@ -28,7 +28,8 @@ from preprocessing import octonet_config as C, octonet_scene as S, vayyar_radar_
 
 DATA_OUT = os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT)
 # the scaffold STAGE output (python -m mm4DPS.reconstruction scaffold --dataset octonet) when present, else the viz one
-SCAFFOLD_DIR = os.environ.get("OCTONET_SCAFFOLD_DIR", os.path.join(DATA_OUT, "4dps_scaffold_S1") if os.path.isdir(os.path.join(DATA_OUT, "4dps_scaffold_S1")) else os.path.join(DATA_OUT, "scaffold_S1_calibrated"))
+_SC = [d for d in ("4dps_scaffold_S1", "scaffold_S1_calibrated") if os.path.isdir(os.path.join(DATA_OUT, d))]   # v1 default; v2 (planar normals) via OCTONET_SCAFFOLD_DIR, see docs/findings
+SCAFFOLD_DIR = os.environ.get("OCTONET_SCAFFOLD_DIR", os.path.join(DATA_OUT, _SC[0] if _SC else "4dps_scaffold_S1"))
 EXTRINSICS = os.environ.get("OCTONET_EXTRINSICS", os.path.join(DATA_OUT, "calib_S1", "extrinsics.json"))
 VIZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "viz", "render_vs_gt")
 

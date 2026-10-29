@@ -180,7 +180,8 @@ def render_factorized(
 
     # TX phase factors
     tau_tx = d_tx / C_LIGHT                                            # (M, n_tx)
-    phi_tx_const = TWO_PI * rast.center_freq * tau_tx                  # (M, n_tx)
+    _f_carrier = rast.center_freq if getattr(rast, 'psf_carrier_hz', None) is None else rast.psf_carrier_hz
+    phi_tx_const = TWO_PI * _f_carrier * tau_tx                        # (M, n_tx)
     phi_tx_slope = TWO_PI * rast.slope * tau_tx                        # (M, n_tx)
 
     # ================================================================
@@ -224,7 +225,7 @@ def render_factorized(
 
     # RX phase factors
     tau_rx = d_rx / C_LIGHT                                            # (M, n_rx)
-    phi_rx_const = TWO_PI * rast.center_freq * tau_rx                  # (M, n_rx)
+    phi_rx_const = TWO_PI * _f_carrier * tau_rx                        # (M, n_rx)
     phi_rx_slope = TWO_PI * rast.slope * tau_rx                        # (M, n_rx)
 
     # ================================================================
@@ -482,15 +483,22 @@ def render_factorized(
     # Or equivalently: n_peak = (d_tx + d_rx) / (2 × range_res)
     # where range_res = c / (2 × BW) = c × fs / (2 × S × K)
     d_total = d_tx.unsqueeze(-1) + d_rx.unsqueeze(-2)          # (M, n_tx, n_rx) bistatic path
-    if getattr(rast, 'modulation_scheme', 'FMCW') == 'SFCW':
+    _mod = getattr(rast, 'modulation_scheme', 'FMCW')
+    if _mod == 'SFCW':
         # SFCW (Vayyar): range compression is an N-point IFFT over the n_freq CW tones; the
         # range-bin spacing of that transform is c/(2*K*df) (K = n_freq). This is the
         # stepped-frequency analogue of the FMCW c*fs/(2*slope*K) below and keeps n_peak
         # consistent with the K-bin range profile the Hann PSF splats into.
         range_res = C_LIGHT / (2.0 * K * rast.freq_step)
+    elif _mod == 'UWB':
+        # UWB (X4): the range axis is the RF sample index, bin = c / (2 fs); the on-board delay of the
+        # direct coupling is a constant bin offset (measured from the data).
+        range_res = rast.range_res
     else:
         range_res = C_LIGHT * rast.sample_rate / (2.0 * rast.slope * K)
     n_peak = d_total / (2.0 * range_res)                        # (M, n_tx, n_rx) real-valued
+    if getattr(rast, 'range_bin_offset', 0.0):
+        n_peak = n_peak + rast.range_bin_offset
 
     # Carrier phase: 2π × f0 × τ  (encodes azimuth information)
     phi_carrier = phi_tx_const.unsqueeze(-1) + phi_rx_const.unsqueeze(-2)  # (M, n_tx, n_rx)
@@ -505,19 +513,28 @@ def render_factorized(
     # arange(-(L//2), L//2+1) below, so callers should keep L odd.
     SPREAD = 15 if psf_spread is None else int(psf_spread)
 
-    # Lazy-init PSF table (created once, reused across calls)
-    if not hasattr(render_factorized, '_psf_table') or \
-       render_factorized._psf_table.K != K or \
-       render_factorized._psf_table.spread != SPREAD or \
-       render_factorized._psf_table.device != str(device):
-        render_factorized._psf_table = HannPSFTable(K, SPREAD, n_grid=1024, device=str(device))
-    psf_table = render_factorized._psf_table
+    if getattr(rast, 'psf_template', None) is not None:
+        # measured range kernel (UWB): one table per (template, device), spread = the kernel's length
+        from mm3DPS.psf import TemplatePSFTable
+        _tkey = (id(rast.psf_template), rast.psf_template_centre, str(device))
+        if not hasattr(render_factorized, '_template_psf') or render_factorized._template_psf[0] != _tkey:
+            render_factorized._template_psf = (_tkey, TemplatePSFTable(rast.psf_template, rast.psf_template_centre, n_grid=1024, device=str(device)))
+        psf_table = render_factorized._template_psf[1]
+        SPREAD = psf_table.spread
+    else:
+        # Lazy-init PSF table (created once, reused across calls)
+        if not hasattr(render_factorized, '_psf_table') or \
+           render_factorized._psf_table.K != K or \
+           render_factorized._psf_table.spread != SPREAD or \
+           render_factorized._psf_table.device != str(device):
+            render_factorized._psf_table = HannPSFTable(K, SPREAD, n_grid=1024, device=str(device))
+        psf_table = render_factorized._psf_table
 
     # Phase D: fused CUDA Step-5 kernel — avoids materializing the
     # (SPREAD, M·n_tx·n_rx) contrib tensors (~540 MB at target_n=90K).
     # Falls back to PyTorch scatter_add when the extension isn't loaded
     # or use_cuda_kernels is False.
-    _use_cuda_step5 = use_cuda_kernels and detach_phase  # fused bwd assumes detached phase
+    _use_cuda_step5 = use_cuda_kernels and detach_phase and getattr(rast, 'psf_template', None) is None  # fused bwd assumes detached phase; template PSF stays on the torch path
     if _use_cuda_step5:
         try:
             from mm3DPS import cuda as _v5cuda

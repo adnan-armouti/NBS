@@ -6,7 +6,7 @@ records slow-time Doppler); the range kernel is what differs per head:
 
     SFCW  : stepped-frequency channel -> Hann IFFT over the 100 tones (3.75 cm bins)
     Wi-Fi : 114 subcarriers over 40 MHz, bistatic Tx -> scatterer -> Rx (+ explicit LOS)
-    UWB   : the measured X4 pulse template (fc 7.0 GHz, BW 1.46 GHz; Gaussian fallback) at delay (Rt+Rr)/c on the 1535-bin grid, on-board delay included
+    UWB   : the 3DPS rasterizer in UWB mode -- the measured X4 pulse template as the range kernel, on-board delay as a bin offset (the point sum is deprecated)
 
 Shared input convention (what ``mm4DPS.octonet`` produces from the scaffold + calibration):
     cloud    : dict(xyz (N,3) float64 tensor [MoCap world, m], normals (N,3) float64 tensor or None)
@@ -304,7 +304,8 @@ def uwb_range_offset_m(device="cpu") -> float:
     return (tpl[3] * UWB_BIN_M) if tpl is not None else 0.0
 
 
-def uwb_head(cloud: dict, material: dict, sensor: dict, chunk: int = 8192, beam_deg: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def uwb_head_pointsum_deprecated(cloud: dict, material: dict, sensor: dict, chunk: int = 8192, beam_deg: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    _deprecated_guard("uwb_head_pointsum_deprecated")
     """Monostatic UWB CIR on the X4's 1535-bin one-way range grid: sum over points of
     |refl(fc)| / (Rt*Rr) * pulse(r - (Rt+Rr)/2). Returns (cir_rf, cir_env): the coherent real RF
     waveform (carrier at fc, phases from the path) and the incoherent envelope sum (what the
@@ -327,6 +328,74 @@ def uwb_head(cloud: dict, material: dict, sensor: dict, chunk: int = 8192, beam_
         env = env + (a * uwb_pulse(rr, rf=False)).sum(0)
         rf = rf + (a * uwb_pulse(rr, rf=True)).sum(0)
     return rf, env
+
+
+# ============================================================================ UWB head = the 3DPS rasterizer (UWB mode)
+# Same route as the SFCW head (T23): mm3DPS.rasterizer_factorized.render_factorized with the X4 config
+# (nbs/preprocessing/x4_radar_config.py): Jones BSDF with the six material parameters (epsilon from the ITU law at 7 GHz),
+# a datasheet stand-in element pattern (65 deg), the MC hemisphere weight, detached phase, and -- the UWB-specific
+# minimal changes -- the MEASURED pulse template as the range kernel (carrier included, per-path carrier phase zero:
+# a path delay is a pure time shift of the pulse) and the on-board delay as a bin offset. Output is the real RF frame
+# on the 1535-bin grid plus its Hilbert envelope. The old point sum is `uwb_head_pointsum_deprecated` (guarded).
+X4_PATTERN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "nbs", "assets", "antenna_pattern", "X4")
+_UWB_RAST = {}
+
+
+def x4_rasterizer(sensor: dict, device):
+    """The 3DPS Rasterizer in UWB mode for the X4 at ``sensor['pos']`` / ``sensor['boresight']`` (cached per pose)."""
+    from mm3DPS import rasterizer as RZ
+    from preprocessing import x4_radar_config as X4
+    pos = np.round(np.asarray(sensor["pos"], float), 6); bore = np.asarray(sensor["boresight"], float); bore = bore / np.linalg.norm(bore)
+    key = (tuple(pos), tuple(np.round(bore, 6)), str(device))
+    if key not in _UWB_RAST:
+        import json, hashlib
+        cfg = X4.build_config(radar_pos=pos, boresight=bore)
+        h = hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:10]
+        cfg_dir = os.path.join(os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT), "uwb_configs"); os.makedirs(cfg_dir, exist_ok=True)
+        cfg_path = os.path.join(cfg_dir, f"x4_uwb_{h}.json")
+        if not os.path.exists(cfg_path):
+            json.dump(cfg, open(cfg_path, "w"), indent=1)
+        tx_pat = os.path.join(X4_PATTERN_DIR, "tx_7.npy"); rx_pat = os.path.join(X4_PATTERN_DIR, "rx_7.npy")
+        for pth in (tx_pat, rx_pat):
+            if not os.path.exists(pth):
+                write_vayyar_pattern(pth, e_bw_deg=X4.BEAMWIDTH_DEG, h_bw_deg=X4.BEAMWIDTH_DEG, gmax_db=5.0)
+        _UWB_RAST[key] = RZ.Rasterizer(cfg_path, "/none.ply", tx_pat, rx_pat, device=str(device))
+    return _UWB_RAST[key]
+
+
+def hilbert_envelope(x: torch.Tensor) -> torch.Tensor:
+    """|analytic signal| of a real 1-D tensor (differentiable)."""
+    n = x.shape[-1]; X = torch.fft.fft(x.to(torch.float64))
+    h = torch.zeros(n, dtype=torch.float64, device=x.device); h[0] = 1; h[1:(n + 1) // 2] = 2
+    if n % 2 == 0: h[n // 2] = 1
+    return torch.fft.ifft(X * h).abs()
+
+
+def uwb_head(cloud: dict, material: dict, sensor: dict, chunk: int | None = None, detach_phase: bool = True,
+             shadow_mask=None) -> tuple[torch.Tensor, torch.Tensor]:
+    """UWB frame through the 3DPS rasterizer: returns (cir_rf (1535,) real, cir_env (1535,)) on the X4's measured
+    bin grid (on-board delay included). cloud/material/sensor as for sfcw_head (material at 7.0 GHz)."""
+    from mm3DPS.rasterizer_factorized import render_factorized
+    from preprocessing import x4_radar_config as X4
+    xyz = cloud["xyz"]; dev = xyz.device
+    rast = x4_rasterizer(sensor, dev)
+    pos = torch.as_tensor(sensor["pos"], dtype=torch.float64, device=dev)
+    w_in = pos[None, :] - xyz; nrm = cloud["normals"]
+    if nrm is None:
+        nrm = w_in / w_in.norm(dim=1, keepdim=True)
+    else:
+        flip = (nrm * w_in).sum(1, keepdim=True) < 0
+        nrm = torch.where(flip, -nrm, nrm)
+    physics = sfcw_physics(cloud, material, f_ghz=X4.FC_HZ / 1e9)
+    areas = torch.ones(xyz.shape[0], device=dev, dtype=torch.float32)
+    if shadow_mask is None and cloud.get("shadow_mask", None) is not None:
+        shadow_mask = cloud["shadow_mask"]
+    if shadow_mask is not None and shadow_mask.dim() == 1:
+        shadow_mask = shadow_mask[:, None].expand(-1, rast.n_tx)
+    rr, ri = render_factorized(xyz.float(), nrm.float(), areas, physics, rast, lambda phys: phys,
+                               detach_phase=detach_phase, shadow_mask=shadow_mask, use_cuda_kernels=False)
+    rf = rr.double().reshape(-1)                                       # (1535,) real RF frame (imag is zero by construction)
+    return rf, hilbert_envelope(rf)
 
 
 # ----------------------------------------------------------------------------- self-test
@@ -391,15 +460,30 @@ def selftest(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> bo
     cl0 = _cloud([p + 100.0], None, device)      # scatterer far away: LOS dominates
     cir = WF.csi_to_cir(wifi_head(cl0, _material(1, device), sens_l)[0]).abs(); tap = int(cir[0].argmax())
     check(f"WiFi LOS term -> first tap (d={d:.2f} m, tap {tap}, expect {round(d / 7.5)})", tap == round(d / 7.5))
-    # --- UWB: target at 3 m -> bin 465 (+-2); two targets; gradient
-    clu = _cloud([pos0 + bore * 3.0], None, device); mu = _material(1, device, grad=True)
-    off = uwb_range_offset_m(device) / UWB_BIN_M
-    rf, env = uwb_head(clu, mu, sensor); k = int(env.argmax()); check(f"UWB point target 3 m -> bin {k} (expect {round(3.0 / UWB_BIN_M + off)}, incl. {off:.0f}-bin on-board delay)", abs(k - round(3.0 / UWB_BIN_M + off)) <= 2)
-    env.sum().backward(); check("UWB gradient flows", mu["rho"].grad is not None and torch.isfinite(mu["rho"].grad).all())
-    clu2 = _cloud([pos0 + bore * 1.0, pos0 + bore * 2.0], None, device); _, env2 = uwb_head(clu2, _material(2, device), sensor)
+    # --- UWB (3DPS rasterizer in UWB mode, measured pulse template): deprecated point sum raises; point target bin;
+    #     pulse shape == measured template; two targets; gradients
+    try:
+        uwb_head_pointsum_deprecated(_cloud([[0, 0, 0]], None, device), _material(1, device), sensor); raised = False
+    except RuntimeError:
+        raised = True
+    check("UWB deprecated point-sum head raises", raised)
+    from preprocessing import x4_radar_config as X4
+    off = X4.delay_bins()
+    clu = _cloud([pos0 + bore * 3.0], [-bore], device); mu = _material(1, device, grad=True)
+    rf, env = uwb_head(clu, mu, sensor); k = int(env.argmax())
+    check(f"UWB point target 3 m -> bin {k} (expect {round(3.0 / X4.BIN_M + off)}, incl. {off:.0f}-bin on-board delay)", abs(k - round(3.0 / X4.BIN_M + off)) <= 2)
+    tpl = uwb_template(device)
+    if tpl is not None:
+        t_rf, _, half, _ = tpl; seg = rf[k - half:k - half + t_rf.shape[0]].detach().cpu().numpy(); tr = t_rf.cpu().numpy()
+        cc = float(np.corrcoef(seg, tr)[0, 1]) if len(seg) == len(tr) else float("nan")
+        check(f"UWB rendered point-target pulse == measured template (corr {cc:.3f})", cc > 0.95)
+    env.sum().backward(); check("UWB gradient flows to abcd", mu["abcd"].grad is not None and torch.isfinite(mu["abcd"].grad).all())
+    raw6 = torch.zeros(1, 6, dtype=torch.float32, device=device, requires_grad=True)
+    _, e6 = uwb_head(clu, {"raw6": raw6}, sensor); e6.sum().backward()
+    check("UWB gradient flows to the six 3DPS raw parameters", raw6.grad is not None and torch.isfinite(raw6.grad).all() and float(raw6.grad.abs().sum()) > 0)
+    clu2 = _cloud([pos0 + bore * 1.0, pos0 + bore * 2.0], [-bore, -bore], device); _, env2 = uwb_head(clu2, _material(2, device), sensor)
     k1 = int(env2[:233].argmax()); k2 = int(env2[233:].argmax()) + 233
-    check("UWB two targets 1/2 m resolved", abs(k1 - round(1.0 / UWB_BIN_M + off)) <= 2 and abs(k2 - round(2.0 / UWB_BIN_M + off)) <= 2, f"(bins {k1},{k2})")
-    tpl = uwb_template(device); check("UWB measured pulse template loaded" if tpl is not None else "UWB template missing -> Gaussian fallback", True, "" if tpl is None else f"(K={tpl[0].shape[0]}, delay {tpl[3]} bins)")
+    check("UWB two targets 1/2 m resolved", abs(k1 - round(1.0 / X4.BIN_M + off)) <= 2 and abs(k2 - round(2.0 / X4.BIN_M + off)) <= 2, f"(bins {k1},{k2})")
     print("octonet_heads selftest:", "ALL PASS" if ok else "FAILURES")
     return ok
 
