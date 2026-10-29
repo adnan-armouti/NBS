@@ -1,0 +1,7 @@
+sfcw_gt_iter0_trained.png: SFCW GT vs rendered, iter 0 (uniform concrete) vs rendered, trained jointly (SFCW + WIFI) (sfcw_s0); last column = residual.
+sfcw_material.png: the shared per-point material at 65.0 GHz (sfcw_s0).
+sfcw_gains.png: fitted SFCW channel gains vs GT-derived.
+wifi_gt_iter0_trained.png: WIFI GT vs rendered, iter 0 (uniform concrete) vs rendered, trained jointly (SFCW + WIFI) (wifi_s0); last column = residual.
+wifi_material.png: the shared per-point material at 5.18 GHz (wifi_s0).
+uwb_heldout_baseline_transfer.png: UWB GT vs baseline: uniform concrete + fitted nuisances vs zero-shot: material from SFCW + WIFI (uwb_s0); last column = residual.
+uwb_material.png: the shared per-point material at 7.0 GHz (uwb_s0).

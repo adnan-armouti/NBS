@@ -230,14 +230,14 @@ def ms(vals, fmt="{:.3f}"):
     return (fmt.format(v.mean()) + " ± " + fmt.format(v.std())) if len(v) > 1 else fmt.format(v[0])
 
 
-def fig_sfcw(tnp, z, tag, path):
+def fig_sfcw(tnp, z, tag, path, label0="rendered, iter 0 (uniform concrete)", label1="rendered, trained (SFCW alone)"):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     tg = tnp["sfcw"]; m = tg["mask"]; r = tg["range_m"][m]
     G = db(np.abs(tg["rp_mean"]))[:, m]; A0 = db(np.abs(z["r0"]))[:, m]; A1 = db(np.abs(z["r1"]))[:, m]
     G -= np.median(G); A0 -= np.median(A0); A1 -= np.median(A1)
     vmin, vmax = np.percentile(G, 2), np.percentile(G, 98)
     fig, ax = plt.subplots(2, 4, figsize=(22, 10))
-    for j, (X, t) in enumerate(((G, "GT (pooled 5 recordings)"), (A0, "rendered, iter 0 (uniform concrete)"), (A1, "rendered, trained (SFCW alone)"))):
+    for j, (X, t) in enumerate(((G, "GT (pooled 5 recordings)"), (A0, label0), (A1, label1))):
         im = ax[0, j].imshow(X, aspect="auto", origin="lower", extent=[r[0], r[-1], 0, 400], vmin=vmin, vmax=vmax, cmap="viridis")
         ax[0, j].set_title(f"|rp| per pair, dB rel. median\n{t}", fontsize=10); ax[0, j].set_xlabel("range [m]"); ax[0, j].set_ylabel("Tx-Rx pair (tx-major)")
         plt.colorbar(im, ax=ax[0, j], label="dB")
@@ -251,12 +251,12 @@ def fig_sfcw(tnp, z, tag, path):
     fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
-def fig_uwb(tnp, z, tag, path):
+def fig_uwb(tnp, z, tag, path, label0="rendered, iter 0 (uniform concrete)", label1="rendered, trained (UWB alone)"):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     tg = tnp["uwb"]; m = tg["mask"]; r = tg["range_m"]
     G = db(tg["env"]); A0 = db(z["r0"]); A1 = db(z["r1"]); G -= np.median(G[m]); A0 -= np.median(A0[m]); A1 -= np.median(A1[m])
     fig, ax = plt.subplots(2, 4, figsize=(22, 9))
-    for j, (X, t, c) in enumerate(((G, "GT (pooled envelope)", "k"), (A0, "rendered, iter 0 (uniform concrete)", "C0"), (A1, "rendered, trained (UWB alone)", "C3"))):
+    for j, (X, t, c) in enumerate(((G, "GT (pooled envelope)", "k"), (A0, label0, "C0"), (A1, label1, "C3"))):
         for i, (lo, hi) in enumerate(((0.3, 9.9), (0.3, 4.0))):
             a = ax[i, j]
             if j: a.plot(r, G, "k", lw=0.8, alpha=0.5, label="GT")
@@ -269,13 +269,13 @@ def fig_uwb(tnp, z, tag, path):
     fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
-def fig_wifi(tnp, z, tag, path):
+def fig_wifi(tnp, z, tag, path, label0="rendered, iter 0", label1="rendered, trained (WiFi alone)"):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(4, 4, figsize=(22, 16)); sc = np.arange(114)
     for i, k in enumerate((1, 2, 3, 4)):
         tg = tnp["wifi"][k]; m = tg["mask"]; G = db(tg["mean_mag"]); A0 = db(z[f"r0_{k}"]); A1 = db(z[f"r1_{k}"])
         G -= np.median(G[:, m], 1, keepdims=True); A0 -= np.median(A0[:, m], 1, keepdims=True); A1 -= np.median(A1[:, m], 1, keepdims=True)
-        for j, (X, t) in enumerate(((G, "GT (pooled |CSI|)"), (A0, "rendered, iter 0"), (A1, "rendered, trained (WiFi alone)"))):
+        for j, (X, t) in enumerate(((G, "GT (pooled |CSI|)"), (A0, label0), (A1, label1))):
             a = ax[i, j]
             for ant, c in ((0, "C0"), (1, "C1")):
                 if j: a.plot(sc[m], G[ant][m], color="k", lw=0.8, alpha=0.4)
