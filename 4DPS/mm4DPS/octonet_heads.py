@@ -226,6 +226,10 @@ def sfcw_head(cloud: dict, material: dict, sensor: dict, chunk: int | None = Non
         nrm = torch.where(flip, -nrm, nrm)
     physics = sfcw_physics(cloud, material)
     areas = torch.ones(xyz.shape[0], device=dev, dtype=torch.float32)
+    if shadow_mask is None and cloud.get("shadow_mask", None) is not None:
+        shadow_mask = cloud["shadow_mask"]                       # (N,) or (N, n_tx) bool: False = occluded from the radar
+    if shadow_mask is not None and shadow_mask.dim() == 1:
+        shadow_mask = shadow_mask[:, None].expand(-1, rast.n_tx)
     rr, ri = render_factorized(xyz.float(), nrm.float(), areas, physics, rast, lambda phys: phys,
                                detach_phase=detach_phase, shadow_mask=shadow_mask, use_cuda_kernels=use_cuda_kernels)
     rp = torch.complex(rr.double(), ri.double()).reshape(rast.n_tx * rast.n_rx, rast.K)      # tx-major pairs
