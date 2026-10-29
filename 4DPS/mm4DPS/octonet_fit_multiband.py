@@ -1,19 +1,24 @@
-"""Material v2 for OctoNet: one ITU-dispersive material FIELD stored on a voxel grid (T11), fitted jointly to the
-SFCW, UWB and Wi-Fi static targets of Scene 1 (T12), with a held-out-band gate.
+"""OctoNet single-band and joint material fits, 3DPS-style (per-point materials), with the ported 4DPS nuisance models.
 
-State = raw voxel grid (V,V,V,4) over the scaffold's bounding box, trilinearly interpolated at the scaffold points,
-mapped to ITU-R P.2040 coefficients  eps'(f) = a f^b,  sigma(f) = c f^d  (a in [1,15], b in [-0.2,0.2],
-c in [1e-3, 2] S/m, d in [0,1.5]); rho = 1 (the grid absorbs scale). Every band's loss is a median-normalised
-log-magnitude L1 (scale-free), so no per-band gain is needed:
-  SFCW : nbs/method/sfcw_target.sfcw_static_loss(kind='logmag', weight='xcorr'), bins < 24 (0.9 m) masked
-  UWB  : log|hilbert(cir_rf)| vs log(target env), masked (guard 45 bins), weighted by cross-recording reliability
+Material (default ``per-point``, as 3DPS optimises it): ONE six-parameter material per scaffold point
+[eps', eps'', sigma_h, l_c, tau, thickness]; eps', eps'' come from a per-point ITU-R P.2040 dispersion
+eps'(f) = a f^b, sigma(f) = c f^d evaluated at the band centre, with (a, c) per point and the exponents (b, d) frozen at
+the init class (a single band cannot identify them; ``free_exponents`` releases them for joint fits), and the four
+roughness/slab parameters per point in the 3DPS raw space (``reparameterize_torch`` bounds). ``grid`` keeps the
+Hofmann-style voxel field of T11 (4 ITU coefficients on a V^3 grid, trilinear) for the transfer experiments.
+Nuisances (``mm4DPS.octonet_noise``, the 4DPS models): a learned receiver noise floor (measured envelope prior x learned
+scale x DCT range correction, added in POWER under the magnitude) and the coherent near-field coupling block (added
+after a learned absolute gain; the loss then sees the near bins the T4 guard removed). With them the SFCW/UWB losses are
+log-magnitude L1 in absolute units; WiFi keeps the median-normalised magnitude-only loss (no envelope measured).
+  SFCW : nbs/method/sfcw_target.sfcw_static_loss(kind='logmag', weight='xcorr'), 20 + 20 channel gains (D13)
+  UWB  : log|hilbert(cir_rf)| vs log(target env), weighted by cross-recording reliability
   WiFi : log|CSI| per receiver/antenna/subcarrier vs log(mean |CSI|), HT40 notches masked, weighted by reliability
 Joint loss = sum_b L_b / L_b(start).
 
-  python -m mm4DPS.octonet_fit_multiband run --bands sfcw            # T11: SFCW alone on the grid
-  python -m mm4DPS.octonet_fit_multiband run --bands sfcw,uwb,wifi   # joint
+  python -m mm4DPS.octonet_fit_multiband run --bands sfcw                        # per-point + noise model + coupling (defaults)
+  python -m mm4DPS.octonet_fit_multiband run --bands uwb --material grid --noise-model off --coupling off   # the T11 grid, gated
   python -m mm4DPS.octonet_fit_multiband gate --held wifi --seeds 0,1,2
-  python -m mm4DPS.octonet_fit_multiband report                      # tables + viz/render_vs_gt/multiband_fit.png
+  python -m mm4DPS.octonet_fit_multiband report                                   # tables + viz/render_vs_gt/multiband_fit.png
 Outputs under $NBS_DATA_OUT/fit_S1_multiband/.
 """
 from __future__ import annotations
@@ -22,6 +27,7 @@ import numpy as np
 import torch
 
 from mm4DPS import octonet_heads as OH
+from mm4DPS import octonet_noise as ON
 from mm4DPS.octonet import render_inputs
 from method import sfcw_target as ST
 from method.freq_material import ITU_GT, eps_from_dispersion
@@ -89,18 +95,74 @@ class VoxelGridMaterial(torch.nn.Module):
         return float(((self.hi - self.lo) / (self.voxels - 1)).max())
 
 
+class PerPointMaterial(torch.nn.Module):
+    """3DPS: one six-parameter material per point, frequency-aware. State = raw (a, c) per point [+ (b, d) when
+    ``free_exponents``] through ``abcd_from_raw``'s bounds, and the raw 3DPS roughness block (sigma_h, l_c, tau,
+    thickness) per point through ``reparameterize_torch``. ``material_at`` returns the heads' material dict."""
+
+    def __init__(self, xyz: torch.Tensor, init_abcd=ITU_GT["concrete"], noise: float = 0.01, free_exponents: bool = False,
+                 init_rough: dict | None = None):
+        super().__init__()
+        from mm3DPS.rasterizer import reparameterize_torch
+        n = xyz.shape[0]; dev = xyz.device
+        base = raw_from_abcd(init_abcd).to(dev)
+        self.raw_ac = torch.nn.Parameter(base[[0, 2]].expand(n, 2).clone() + noise * torch.randn(n, 2, dtype=torch.float64, device=dev))
+        bd = base[[1, 3]].expand(n, 2).clone()
+        if free_exponents: self.raw_bd = torch.nn.Parameter(bd)
+        else: self.register_buffer("raw_bd", bd)
+        r = dict(OH.SFCW_DEFAULT_ROUGHNESS); r.update(init_rough or {})
+        raw_r = torch.tensor([math.log(r["sigma_h"]), math.log(r["l_c"]), math.log((r["tau"] - 0.05) / (0.95 - r["tau"])), math.log(r["thickness"])], dtype=torch.float64, device=dev)
+        self.raw_rough = torch.nn.Parameter(raw_r.expand(n, 4).clone() + noise * torch.randn(n, 4, dtype=torch.float64, device=dev))
+        self.register_buffer("raw_ac0", self.raw_ac.detach().clone()); self.register_buffer("raw_rough0", self.raw_rough.detach().clone())
+        self._reparam = reparameterize_torch
+        self.free_exponents = free_exponents
+
+    def raw_abcd(self) -> torch.Tensor:
+        return torch.stack([self.raw_ac[:, 0], self.raw_bd[:, 0], self.raw_ac[:, 1], self.raw_bd[:, 1]], -1)
+
+    def material_at(self, xyz: torch.Tensor | None = None) -> dict:
+        abcd = abcd_from_raw(self.raw_abcd())                                       # module-level: the panels' bounds switch applies
+        six = self._reparam(torch.cat([torch.zeros_like(self.raw_rough[:, :2]), self.raw_rough], -1))
+        return dict(abcd=abcd, sigma_h=six[:, 2], l_c=six[:, 3], tau=six[:, 4], thickness=six[:, 5], rho=None)
+
+    def reg(self) -> torch.Tensor:
+        """L2 to the init in raw space (the per-point prior; the grid has TV instead)."""
+        return ((self.raw_ac - self.raw_ac0) ** 2).mean() + ((self.raw_rough - self.raw_rough0) ** 2).mean()
+
+    def tv(self) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float64, device=self.raw_ac.device)
+
+    @property
+    def voxel_m(self) -> float:
+        return 0.0
+
+
+def physics_columns(mat: dict, f_ghz: float) -> np.ndarray:
+    """(N,6) physics at ``f_ghz`` from a material dict (for saving / figures)."""
+    er, ei = eps_from_dispersion(mat["abcd"].detach(), f_ghz)
+    n = mat["abcd"].shape[0]
+    cols = [er, ei] + [(mat[k].detach() if torch.is_tensor(mat.get(k)) else torch.full((n,), float(OH.SFCW_DEFAULT_ROUGHNESS[k]), device=mat["abcd"].device)) for k in ("sigma_h", "l_c", "tau", "thickness")]
+    return torch.stack([c.double() for c in cols], 1).cpu().numpy()
+
+
 # ----------------------------------------------------------------------------- targets and losses
-def load_targets(dev):
+def load_targets(dev, sfcw_guard: int = GUARD_LO_SFCW, uwb_guard: int | None = None):
+    """``sfcw_guard`` / ``uwb_guard``: first supervised bin per band (None = the band's near region, octonet_noise.NEAR_BINS;
+    the coupling model lowers it to its adoption bin). The saved masks' wrap guards (last 6 SFCW bins) stay."""
     t = {}
     z = np.load(os.path.join(DATA_OUT, "sfcw_target_S1", "target_pool5.npz"))
     sf = {k: torch.as_tensor(z[k]) for k in z.files}
-    sf["rp_mean"] = sf["rp_mean"].to(torch.complex128).to(dev); sf["mask"] = sf["mask"].bool().to(dev); sf["mask"][:GUARD_LO_SFCW] = False
+    sf["rp_mean"] = sf["rp_mean"].to(torch.complex128).to(dev); sf["mask"] = sf["mask"].bool().to(dev)
+    sf["mask"][:ON.NEAR_BINS["sfcw"]] = True; sf["mask"][:sfcw_guard] = False
     for k in ("rel", "xcorr", "range_m"):
         if k in sf: sf[k] = sf[k].double().to(dev)
     t["sfcw"] = sf
     z = np.load(os.path.join(DATA_OUT, "uwb_target_S1", "target_pool5.npz"))
+    ug = ON.NEAR_BINS["uwb"] if uwb_guard is None else uwb_guard
+    um = torch.as_tensor(z["mask"]).bool(); um[:ON.NEAR_BINS["uwb"]] = True; um[:ug] = False
     t["uwb"] = dict(env=torch.as_tensor(z["env"], dtype=torch.float64, device=dev), rel=torch.as_tensor(z["rel"], dtype=torch.float64, device=dev).clamp(0, 1),
-                    mask=torch.as_tensor(z["mask"]).bool().to(dev), range_m=torch.as_tensor(z["range_m"], dtype=torch.float64, device=dev))
+                    mask=um.to(dev), range_m=torch.as_tensor(z["range_m"], dtype=torch.float64, device=dev), guard_bins=ug)
+    t["sfcw"]["guard_bins"] = sfcw_guard
     w = {}
     for k in (1, 2, 3, 4):
         z = np.load(os.path.join(DATA_OUT, "wifi_target_S1", f"target_pool5_rx{k}.npz"))
@@ -132,19 +194,55 @@ def wifi_sensor():
     return dict(tx=S.WIFI_TX_APPROX, rx={k: S.WIFI_RX_APPROX[k] for k in (1, 2, 3, 4)}, los={1: True, 2: True, 3: True, 4: False})
 
 
-def band_loss(band: str, cloud, material, sensors, targets, chunk=4096):
-    """(scalar loss, dict of rendered quantities for figures)."""
+class BandNuisance:
+    """Per-band absolute gain + the ported 4DPS nuisances (octonet_noise): ``log_gain`` (1,) learned, ``floor`` a
+    LearnedNoiseFloor or None, ``block`` a CouplingBlock or None. ``None`` for a band = the scale-free loss."""
+
+    def __init__(self, band: str, dev, noise_model: bool, coupling: bool):
+        self.band = band
+        self.floor = ON.LearnedNoiseFloor.load(band, dev) if noise_model else None
+        self.block = ON.CouplingBlock.load(band, dev) if (coupling and ON.coupling_available(band)) else None
+        self.log_gain = torch.zeros(1, dtype=torch.float64, device=dev, requires_grad=True)
+
+    def parameters(self):
+        return [self.log_gain] + (list(self.floor.parameters()) if self.floor is not None else [])
+
+    @torch.no_grad()
+    def init(self, cloud, material, sensors, targets):
+        """Iteration-0 gain = median log ratio over the supervised cells; floor starts at the target's 5th-percentile power."""
+        # the gain is estimated on the far region only (bins >= NEAR_BINS), where the block (product units) is zero
+        if self.band == "sfcw":
+            rp = OH.sfcw_head(cloud, material, sensors["vayyar"]); tg = targets["sfcw"]; m = tg["mask"].clone(); m[:ON.NEAR_BINS["sfcw"]] = False
+            self.log_gain.copy_(ON.init_log_gain(rp.abs(), tg["rp_mean"].abs(), m))
+            if self.floor is not None: self.floor.init_scale(float((tg["rp_mean"].abs()[:, m] ** 2).flatten().quantile(0.05)))
+        else:
+            rf, _ = OH.uwb_head(cloud, material, sensors["uwb"]); env = OH.hilbert_envelope(rf); tg = targets["uwb"]; m = tg["mask"].clone(); m[:ON.NEAR_BINS["uwb"]] = False
+            self.log_gain.copy_(ON.init_log_gain(env, tg["env"], m))
+            if self.floor is not None: self.floor.init_scale(float((tg["env"][m] ** 2).quantile(0.05)))
+
+    def state(self) -> dict:
+        return dict(log_gain=float(self.log_gain), floor=(self.floor.summary() if self.floor is not None else None),
+                    coupling=(dict(adopt_from_bin=self.block.adopt_from_bin, near_bins=self.block.near) if self.block is not None else None))
+
+
+def band_loss(band: str, cloud, material, sensors, targets, chunk=4096, nuisance: BandNuisance | None = None):
+    """(scalar loss, dict of rendered quantities for figures). With ``nuisance`` the SFCW/UWB render is in absolute units
+    (gain, coupling block, floored magnitude) and the loss is un-normalised; without it, median-normalised."""
     if band == "sfcw":
         rp = OH.sfcw_head(cloud, material, sensors["vayyar"], chunk=chunk)
-        loss, per_bin = ST.sfcw_static_loss(rp, targets["sfcw"], kind="logmag", weight="xcorr")
+        if nuisance is not None: rp = ON.apply_sfcw(rp, nuisance.log_gain, nuisance.block, nuisance.floor)
+        loss, per_bin = ST.sfcw_static_loss(rp, targets["sfcw"], kind="logmag", weight="xcorr", normalize=nuisance is None)
         return loss, dict(rp=rp.detach())
     if band == "uwb":
         rf, _ = OH.uwb_head(cloud, material, sensors["uwb"])
-        env = hilbert_env(rf); tg = targets["uwb"]; m = tg["mask"]; w = tg["rel"] * m
+        if nuisance is not None: rf, env = ON.apply_uwb(rf, nuisance.log_gain, nuisance.block, nuisance.floor)
+        else: env = hilbert_env(rf)
+        tg = targets["uwb"]; m = tg["mask"]; w = tg["rel"] * m
         la = torch.log(env + EPS); lb = torch.log(tg["env"] + EPS)
-        la = la - la[m].median(); lb = lb - lb[m].median()
+        if nuisance is None:
+            la = la - la[m].median(); lb = lb - lb[m].median()
         loss = ((la - lb).abs() * w).sum() / (w.sum() + EPS)
-        return loss, dict(env=env.detach())
+        return loss, dict(env=env.detach(), rf=rf.detach())
     if band == "wifi":
         H = OH.wifi_head(cloud, material, sensors["wifi"])                     # (4,2,114)
         tot = 0.0; outs = {}
@@ -167,28 +265,43 @@ def setup(dev, n_points, seed):
     return cloud, material0, sensors
 
 
-def evaluate(bands, cloud, material, sensors, targets):
+def evaluate(bands, cloud, material, sensors, targets, nuis=None):
     with torch.no_grad():
-        return {b: band_loss(b, cloud, material, sensors, targets)[0].item() for b in bands}
+        return {b: band_loss(b, cloud, material, sensors, targets, nuisance=(nuis or {}).get(b))[0].item() for b in bands}
 
 
-def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed=0, tag=None, verbose=True, gains=True, gain_l2=0.01, patience=60):
-    """Fit the voxel-grid ITU field on ``bands``. For the SFCW band, ``gains`` adds the 20 + 20 learnable log-amplitude
-    per-channel gains of the raw Vayyar phasors (D13; init 0, same Adam, L2 ``gain_l2``); the median normalisation of the
-    loss removes the global scale, so the L2 only pins the per-channel spread. The returned ``sensors['vayyar']`` carries
-    the fitted linear gains (``gain_tx``/``gain_rx``); ``sensors_without_gains`` strips them for an iteration-0 render."""
+def make_material(kind: str, cloud, voxels: int, dev, free_exponents: bool = False):
+    if kind == "per-point": return PerPointMaterial(cloud["xyz"], free_exponents=free_exponents).to(dev)
+    if kind == "grid": return VoxelGridMaterial(cloud["xyz"], voxels=voxels).to(dev)
+    raise ValueError(kind)
+
+
+def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed=0, tag=None, verbose=True, gains=True, gain_l2=0.01, patience=60,
+        material="per-point", l2=0.05, noise_model=True, coupling=True, free_exponents=False):
+    """Fit the material on ``bands``. ``material``: 'per-point' (3DPS, default) or 'grid' (T11 voxel field, TV ``tv``);
+    ``l2`` = the per-point prior to the init. ``noise_model`` / ``coupling`` (SFCW and UWB): the ported 4DPS nuisances
+    (``octonet_noise``), each with a learned absolute gain per band; off = the scale-free median-normalised loss and the
+    near-region guard. For the SFCW band, ``gains`` adds the 20 + 20 learnable log-amplitude per-channel gains (D13; L2
+    ``gain_l2`` pins their spread). The returned ``sensors['vayyar']`` carries the fitted linear gains; the returned
+    ``nuis`` dict (band -> BandNuisance) is needed to render the trained model."""
     cloud, material0, sensors = setup(dev, n_points, seed)
     sensors = sensors_without_gains(sensors)
-    targets = load_targets(dev)
-    grid = VoxelGridMaterial(cloud["xyz"], voxels=voxels).to(dev)
+    targets = load_targets(dev, sfcw_guard=ON.guard_bins("sfcw", coupling), uwb_guard=ON.guard_bins("uwb", coupling))
+    grid = make_material(material, cloud, voxels, dev, free_exponents)
     use_gains = bool(gains) and ("sfcw" in bands)
     g_tx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=use_gains)
     g_rx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=use_gains)
-    params = [{"params": list(grid.parameters()), "lr": lr}] + ([{"params": [g_tx, g_rx], "lr": lr}] if use_gains else [])
-    opt = torch.optim.Adam(params)
-    # start losses (uniform concrete == the grid's init up to noise, gains = 1) on ALL bands for the gate
     mat0 = dict(abcd=material0["abcd"], rho=None)
-    start_all = evaluate(BANDS, cloud, mat0, sensors, targets)
+    nuis = {}
+    for b in ("sfcw", "uwb"):
+        if noise_model or coupling:
+            nuis[b] = BandNuisance(b, dev, noise_model, coupling); nuis[b].init(cloud, mat0, sensors, targets)
+    params = [{"params": list(grid.parameters()), "lr": lr}] + ([{"params": [g_tx, g_rx], "lr": lr}] if use_gains else [])
+    nparams = [p for b in bands if b in nuis for p in nuis[b].parameters()]
+    if nparams: params.append({"params": nparams, "lr": lr})
+    opt = torch.optim.Adam(params)
+    # start losses (uniform concrete == the material's init up to noise, gains = 1, iteration-0 gain/floor) on ALL bands for the gate
+    start_all = evaluate(BANDS, cloud, mat0, sensors, targets, nuis)
     w = {b: 1.0 / max(start_all[b], 1e-6) for b in bands}
     log = []; t0 = time.time(); best = (float("inf"), None, 0, None)
     best_hist = []
@@ -196,15 +309,17 @@ def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed
         opt.zero_grad(set_to_none=True)
         mat = grid.material_at(cloud["xyz"])
         sens = sensors_with_gains(sensors, g_tx, g_rx) if use_gains else sensors
-        parts = {b: band_loss(b, cloud, mat, sens, targets)[0] for b in bands}
+        parts = {b: band_loss(b, cloud, mat, sens, targets, nuisance=nuis.get(b))[0] for b in bands}
         reg_g = gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean()) if use_gains else 0.0
-        total = sum(w[b] * parts[b] for b in bands) + tv * grid.tv() + reg_g
+        reg_m = (l2 * grid.reg()) if isinstance(grid, PerPointMaterial) else (tv * grid.tv())
+        total = sum(w[b] * parts[b] for b in bands) + reg_m + reg_g
         total.backward(); opt.step()
         rec = dict(step=step, total=float(total), **{b: float(parts[b]) for b in bands}, t=time.time() - t0)
         if use_gains: rec["gain_tx_std"] = float(g_tx.std()); rec["gain_rx_std"] = float(g_rx.std())
         log.append(rec)
         if float(total) < best[0]:
-            best = (float(total), {k: v.detach().clone() for k, v in grid.state_dict().items()}, step, (g_tx.detach().clone(), g_rx.detach().clone()))
+            best = (float(total), {k: v.detach().clone() for k, v in grid.state_dict().items()}, step, (g_tx.detach().clone(), g_rx.detach().clone()),
+                    {b: (n.log_gain.detach().clone(), (n.floor.state_dict() if n.floor is not None else None)) for b, n in nuis.items()})
         if verbose and (step % 25 == 0 or step == 1):
             print(f"  [{tag or ','.join(bands)}] step {step:4d} total {float(total):.4f} " + " ".join(f"{b} {float(parts[b]):.4f}" for b in bands)
                   + (f" gains tx/rx std {float(g_tx.std()):.3f}/{float(g_rx.std()):.3f}" if use_gains else "") + f" {time.time()-t0:.0f} s", flush=True)
@@ -219,15 +334,21 @@ def fit(bands, dev, n_points=20000, steps=250, lr=0.03, voxels=28, tv=1e-3, seed
     if use_gains:
         g_tx, g_rx = best[3]
         sensors = sensors_with_gains(sensors, g_tx, g_rx)                     # the fitted gains ride with the sensors
+    for b, (lg, fl) in best[4].items():
+        with torch.no_grad(): nuis[b].log_gain.copy_(lg)
+        if fl is not None: nuis[b].floor.load_state_dict(fl)
     with torch.no_grad():
         mat = grid.material_at(cloud["xyz"])
-        end_all = evaluate(BANDS, cloud, mat, sensors, targets)
+        end_all = evaluate(BANDS, cloud, mat, sensors, targets, nuis)
         abcd = mat["abcd"].cpu().numpy()
-    res = dict(bands=list(bands), seed=seed, points=int(cloud["xyz"].shape[0]), voxels=voxels, voxel_m=grid.voxel_m, steps=len(log), best_step=best[2],
+    res = dict(bands=list(bands), seed=seed, points=int(cloud["xyz"].shape[0]), material=material, voxels=voxels, voxel_m=grid.voxel_m, steps=len(log), best_step=best[2],
+               l2=l2, noise_model=bool(noise_model), coupling=bool(coupling), guards=dict(sfcw=int(targets["sfcw"]["guard_bins"]), uwb=int(targets["uwb"]["guard_bins"])),
+               nuisance={b: n.state() for b, n in nuis.items()},
                start=start_all, end=end_all, log=log, runtime_s=time.time() - t0,
                gains=(dict(enabled=True, l2=gain_l2, tx_log=g_tx.detach().cpu().numpy().tolist(), rx_log=g_rx.detach().cpu().numpy().tolist(),
                            tx_std_db=float(20 / math.log(10) * g_tx.detach().std()), rx_std_db=float(20 / math.log(10) * g_rx.detach().std()))
                       if use_gains else dict(enabled=False)))
+    res["nuis"] = nuis
     return res, grid, abcd, cloud, sensors, targets
 
 
@@ -251,11 +372,13 @@ def dispersion_summary(abcd: np.ndarray) -> dict:
 
 def save_run(name, res, grid, abcd, cloud, extra=None):
     os.makedirs(OUT, exist_ok=True)
-    res = dict(res); res["dispersion"] = dispersion_summary(abcd); res.update(extra or {})
+    res = dict(res); res.pop("nuis", None); res["dispersion"] = dispersion_summary(abcd); res.update(extra or {})
     json.dump(res, open(os.path.join(OUT, f"{name}.json"), "w"), indent=1)
     g = res.get("gains", {}) or {}
-    np.savez(os.path.join(OUT, f"{name}_material.npz"), xyz=cloud["xyz"].cpu().numpy(), abcd=abcd, grid=grid.grid.detach().cpu().numpy(),
-             lo=grid.lo.cpu().numpy(), hi=grid.hi.cpu().numpy(),
+    extra_arrays = (dict(grid=grid.grid.detach().cpu().numpy(), lo=grid.lo.cpu().numpy(), hi=grid.hi.cpu().numpy()) if isinstance(grid, VoxelGridMaterial)
+                    else dict(physics_sfcw=physics_columns(grid.material_at(), BAND_FC_GHZ["sfcw"]), physics_uwb=physics_columns(grid.material_at(), BAND_FC_GHZ["uwb"]),
+                              physics_columns=np.array(["eps_r", "eps_i", "sigma_h", "l_c", "tau", "thickness"])))
+    np.savez(os.path.join(OUT, f"{name}_material.npz"), xyz=cloud["xyz"].cpu().numpy(), abcd=abcd, **extra_arrays,
              gain_tx_log=np.asarray(g.get("tx_log", np.zeros(20)), float), gain_rx_log=np.asarray(g.get("rx_log", np.zeros(20)), float))
     return res
 
@@ -263,7 +386,9 @@ def save_run(name, res, grid, abcd, cloud, extra=None):
 # ----------------------------------------------------------------------------- commands
 def cmd_run(a):
     dev = torch.device(a.device); bands = tuple(a.bands.split(","))
-    res, grid, abcd, cloud, sensors, targets = fit(bands, dev, a.points, a.steps, a.lr, a.voxels, a.tv, a.seed, tag=a.tag, gains=not a.no_gains, gain_l2=a.gain_l2)
+    res, grid, abcd, cloud, sensors, targets = fit(bands, dev, a.points, a.steps, a.lr, a.voxels, a.tv, a.seed, tag=a.tag, gains=not a.no_gains, gain_l2=a.gain_l2,
+                                                   **fit_kwargs(a))
+    nuis = res["nuis"]
     name = a.tag or ("run_" + "_".join(bands) + f"_s{a.seed}")
     sensors0 = sensors_without_gains(sensors)
     # rendered quantities before/after for the figure
@@ -272,7 +397,7 @@ def cmd_run(a):
         mat1 = grid.material_at(cloud["xyz"])
         rend = {}
         for b in BANDS:
-            _, r0 = band_loss(b, cloud, mat0, sensors0, targets); _, r1 = band_loss(b, cloud, mat1, sensors, targets)
+            _, r0 = band_loss(b, cloud, mat0, sensors0, targets, nuisance=nuis.get(b)); _, r1 = band_loss(b, cloud, mat1, sensors, targets, nuisance=nuis.get(b))
             if b == "sfcw":
                 rend["sfcw_before"] = r0["rp"].abs().mean(0).cpu().numpy(); rend["sfcw_after"] = r1["rp"].abs().mean(0).cpu().numpy()
             elif b == "uwb":
@@ -289,7 +414,7 @@ def cmd_run(a):
 def cmd_gate(a):
     dev = torch.device(a.device); held = a.held; train = tuple(b for b in BANDS if b != held)
     for seed in [int(s) for s in a.seeds.split(",")]:
-        res, grid, abcd, cloud, sensors, targets = fit(train, dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=f"gate_{held}_s{seed}", gains=not a.no_gains, gain_l2=a.gain_l2)
+        res, grid, abcd, cloud, sensors, targets = fit(train, dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=f"gate_{held}_s{seed}", gains=not a.no_gains, gain_l2=a.gain_l2, **fit_kwargs(a))
         res = save_run(f"gate_held_{held}_s{seed}", res, grid, abcd, cloud, dict(held=held, held_start=res["start"][held], held_end=res["end"][held]))
         print(f"gate held={held} seed={seed}: uniform concrete {res['held_start']:.4f} -> two-band fit {res['held_end']:.4f}  (train: " + " ".join(f"{b} {res['start'][b]:.3f}->{res['end'][b]:.3f}" for b in train) + ")")
 
@@ -404,6 +529,19 @@ def figure(runs):
     fig.savefig(os.path.join(viz, "multiband_fit.png"), dpi=130); print("figure:", os.path.join(viz, "multiband_fit.png"))
 
 
+def add_model_args(p):
+    """The material / nuisance switches shared by this module's commands and the panels (octonet_eval_panels)."""
+    p.add_argument("--material", default="per-point", choices=("per-point", "grid"), help="per-point = 3DPS (default); grid = the T11 voxel ITU field")
+    p.add_argument("--l2", type=float, default=0.05, help="per-point: L2 prior to the init in raw space")
+    p.add_argument("--free-exponents", action="store_true", help="per-point: also fit the ITU exponents b, d per point (joint fits only)")
+    p.add_argument("--noise-model", default="on", choices=("on", "off"), help="learned receiver noise floor (4DPS model, measured prior: octonet_noise measure)")
+    p.add_argument("--coupling", default="on", choices=("on", "off"), help="coherent near-field coupling block instead of the near guard (4DPS model), where adopted")
+
+
+def fit_kwargs(a) -> dict:
+    return dict(material=a.material, l2=a.l2, noise_model=a.noise_model == "on", coupling=a.coupling == "on", free_exponents=a.free_exponents)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -412,6 +550,7 @@ def main(argv=None):
         p.add_argument("--voxels", type=int, default=28); p.add_argument("--tv", type=float, default=1e-3); p.add_argument("--device", default="cuda")
         p.add_argument("--no-gains", action="store_true", help="SFCW: do not fit the 20+20 per-channel gains (pre-D13 behaviour)")
         p.add_argument("--gain-l2", type=float, default=0.01, help="L2 weight on the SFCW log-amplitude channel gains")
+        add_model_args(p)
     r = sub.add_parser("run"); common(r); r.add_argument("--bands", default="sfcw,uwb,wifi"); r.add_argument("--seed", type=int, default=0); r.add_argument("--tag", default=None)
     g = sub.add_parser("gate"); common(g); g.add_argument("--held", required=True, choices=BANDS); g.add_argument("--seeds", default="0,1,2")
     sub.add_parser("report")

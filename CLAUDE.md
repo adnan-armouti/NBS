@@ -56,28 +56,36 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   correction, confirmed by shared walls): always decode depth with `octonet_scene.load_depth_m_calibrated(png, node)`.
   Horizontal camera-to-marker offsets are unobservable (0). The subject walks IN PLACE: motion foregrounds are empty.
 - SFCW objective = `nbs/method/sfcw_target.py` (temporal-mean channel pooled over recordings, two-tone on-board
-  coupling removed, per-bin cross-recording reliability; residual is drift with n_eff ≈ 4 frames). **Range bins < 24
-  (0.9 m) are the node's own near-field return (cover/housing/table), absent from the scaffold: the static fit masks
-  them (`octonet_fit` GUARD_LO=24)**; they are not window leakage (T4). Details in `viz/README.md`, tracker T4.
+  coupling removed, per-bin cross-recording reliability; residual is drift with n_eff ≈ 4 frames). Range bins < 24
+  (0.9 m) are the node's own near-field return (cover/housing/table), absent from the scaffold (not window leakage, T4).
+  **Since 2026-10-29 they are MODELLED, not gated (4DPS port, T27): `4DPS/mm4DPS/octonet_noise.py` = the learned receiver
+  noise floor (held-out envelope prior × learned scale × DCT range correction, added in power) + the coherent near-field
+  coupling block (held-out coherent mean of the near bins, added after a learned absolute gain), both for SFCW and UWB;
+  `python -m mm4DPS.octonet_noise measure` writes `$NBS_DATA_OUT/noise_S1/`. Gates (`GUARD_LO=24`, UWB 45 bins) are
+  only the fallback when the block is not adopted (it is, from bin 0, in both bands).** Details in `viz/README.md`, tracker T4/T27.
 - **Person detectability (T9, 14 recordings): no band passes** (SFCW z −0.1, UWB 2.3, WiFi 0.0 against permutation
   nulls); no person term is built. UWB shows a weak direct-return effect only on large-motion activities.
 - UWB static target: the coherent RF temporal mean is valid (frame coherence 0.985); WiFi: the complex mean is destroyed
   by per-packet carrier phase (coherence 0.01) → magnitude-only target, mask subcarriers [5,33,47,66,80,108]
   (`nbs/method/rf_static_targets.py`). UWB pulse template from the coupling peak: fc 7.0 GHz, −10 dB BW 1.46 GHz,
   FWHM 12.9 cm, on-board delay 4.5 cm (`nbs/method/uwb_template.py`); the paper's "2.5 GHz" is not what the data shows.
-- Multi-band material fit (`4DPS/mm4DPS/octonet_fit_multiband.py`, T11/T12): voxel-grid ITU `abcd` field, SFCW+UWB+WiFi
-  joint; the held-out-band gate gives only 2–3 % gains (SFCW 2σ, UWB marginal, WiFi fail) → **no band-synthesis claim
-  yet**. Known limits: WiFi Tx/Rx schematic (measure them), UWB pose assumed, ITU bounds saturate in the tails
-  (tighten d≤1.0, c≤0.1 S/m or use a class prior). Bounded per-point ρ (0.590) is not comparable to the ITU-bounded
-  grid (0.72–0.80): the former has ±26 dB of freedom, the latter ~12 dB.
+- Material fits (`4DPS/mm4DPS/octonet_fit_multiband.py`, also behind `octonet_eval_panels`): **the default is 3DPS's
+  per-point six-parameter material (`PerPointMaterial`: per-point ITU (a, c) at the band centre, exponents frozen to the
+  init class, sigma_h / l_c / tau / thickness per point in the 3DPS raw space) — never fit the voxel grid by default
+  (user rule 2026-10-29); `--material grid` (the T11 Hofmann field) is for transfer experiments only.** T12's joint fit /
+  held-out-band gate (2–3 % gains, no band-synthesis claim yet) was done with the grid and is to be redone per-point.
+  Known limits: WiFi Tx/Rx schematic (measure them), UWB pose assumed. Single-band state of the art: `viz/render_vs_gt_v4/`.
 - **SFCW head rule (T23, 2026-10-28): `octonet_heads.sfcw_head` IS the 3DPS rasterizer (`mm3DPS.rasterizer_factorized.
   render_factorized`, Jones BSDF with the six material parameters, antenna pattern, hemisphere weight, detached phase)
   on the Vayyar SFCW config; the pre-T23 point sum is `sfcw_head_pointsum_deprecated` and raises. Never render SFCW
   with `sfcw_forward.render_sfcw_pairs` outside `sfcw_migration_selftest`. Findings checklist:
   `docs/findings/sfcw_head_vs_3dps.md` (strike items only with a measurement).**
 - **Project goal (user, 2026-10-28): train on ONE modality (two jointly only as a lower-preference alternative) and
-  evaluate ZERO-SHOT transfer to the other bands.** Single-modality training check: `viz/render_vs_gt_v2/README.md`
-  (T19). Geometry videos: `viz/geometry_v2/` (mp4s git-ignored, on workstation + node).
+  evaluate ZERO-SHOT transfer to the other bands.** Single-modality training check: `viz/render_vs_gt_v4/README.md`
+  (v2/v3 are the grid-era history). Geometry videos: `viz/geometry_v2/` (mp4s git-ignored, on workstation + node).
+- **Match 3DPS/4DPS before inventing (user, 2026-10-29)**: when a component is missing (noise model, near field, material
+  storage), port the 3DPS/4DPS one first; a data-driven shortcut is not acceptable where a physics-informed model exists
+  in those repos. Noise floor and coupling block: `4DPS/mm4DPS/octonet_noise.py` (measured from held-out recordings).
 - Progress on all open items: `docs/plans/OPEN_ITEMS_TRACKER.md`.
 - RGB-D: depth PNGs are **8-bit, linear 0–10 m** (3.9 cm/level; OctoNet `png_to_depth(0,10)`), 640×480,
   ~30 Hz, nodes 1/3/5. The RGB .mp4 is NOT shipped (only cut-window json/txt). No intrinsics shipped

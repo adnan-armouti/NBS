@@ -1,8 +1,10 @@
-"""Single-modality fits with GT / iter-0 / trained panels and metric tables (viz/render_vs_gt_v2).
+"""Single-modality fits with GT / iter-0 / trained panels and metric tables (viz/render_vs_gt_<tag>).
 
-Each band (SFCW, UWB, WiFi) is fitted ALONE with the voxel-grid ITU field of octonet_fit_multiband (V=64), under
-TIGHT bounds (a in [1,15], b in +-0.1, c <= 0.1 S/m, d <= 1.0) for 3 seeds, plus one LOOSE-bound run (the module's
-defaults: b +-0.2, c <= 2, d <= 1.5) for comparison. "iter 0" = the grid's initialisation = uniform ITU concrete.
+Each band (SFCW, UWB, WiFi) is fitted ALONE with octonet_fit_multiband's model: per-point 3DPS six-parameter material
+(default; ``--material grid`` = the T11 voxel field), the ported 4DPS noise floor and coupling block (``--noise-model``,
+``--coupling``), under TIGHT ITU bounds (a in [1,15], b in +-0.1, c <= 0.1 S/m, d <= 1.0) for 3 seeds, plus one
+LOOSE-bound run (b +-0.2, c <= 2, d <= 1.5). "iter 0" = the material's initialisation = uniform ITU concrete with the
+iteration-0 gain / floor.
 
     cd 4DPS && CUDA_VISIBLE_DEVICES=3 python -m mm4DPS.octonet_eval_panels fit --band sfcw [--seeds 0,1,2] [--steps 400]
     python -m mm4DPS.octonet_eval_panels figures            # all bands -> viz/render_vs_gt_v2/ + README.md + captions.txt
@@ -54,22 +56,41 @@ def _pearson(a, b):
     return float((a * b).sum() / d)
 
 
+def _smooth_rows(A, w):
+    k = np.ones(w) / w
+    return np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), -1, A) if w > 1 else A
+
+
 def metrics_sfcw(rp, tg):
-    """rp (400,100) complex render; tg: dict with rp_mean (400,100), mask (100,)."""
-    m = tg["mask"]; A = db(np.abs(rp))[:, m]; G = db(np.abs(tg["rp_mean"]))[:, m]
-    A = A - np.median(A); G = G - np.median(G)
+    """rp (400,100) complex render; tg: dict with rp_mean (400,100), mask (100,). ``*_far`` = bins >= 24 (0.9 m), the pre-coupling-model
+    supervised region (comparable with v2/v3 and with the data ceiling); ``corr_image_far_5bin`` at 19 cm smoothing."""
+    def core(m, w=1):
+        A = _smooth_rows(db(np.abs(rp)), w)[:, m]; G = _smooth_rows(db(np.abs(tg["rp_mean"])), w)[:, m]
+        A = A - np.median(A); G = G - np.median(G)
+        return A, G
+    m = tg["mask"]; A, G = core(m)
     per_pair = np.array([_pearson(A[i], G[i]) for i in range(A.shape[0])])
     pa, pg = A.mean(0), G.mean(0)
+    far = m.copy(); far[:24] = False
+    Af, Gf = core(far); Af5, Gf5 = core(far, 5)
     return dict(rmse_db=float(np.sqrt(((A - G) ** 2).mean())), corr_image=_pearson(A.ravel(), G.ravel()), corr_pair_median=float(np.median(per_pair)),
-                corr_pair_mean_profile=_pearson(pa, pg), rmse_db_pair_mean_profile=float(np.sqrt(((pa - pg) ** 2).mean())))
+                corr_pair_mean_profile=_pearson(pa, pg), rmse_db_pair_mean_profile=float(np.sqrt(((pa - pg) ** 2).mean())),
+                rmse_db_far=float(np.sqrt(((Af - Gf) ** 2).mean())), corr_image_far=_pearson(Af.ravel(), Gf.ravel()), corr_image_far_5bin=_pearson(Af5.ravel(), Gf5.ravel()),
+                corr_pair_mean_profile_far=_pearson(Af.mean(0), Gf.mean(0)), first_bin=int(np.argmax(m)))
 
 
 def metrics_uwb(env, tg):
+    """``corr_ge1m`` / ``corr_1_9m``: bins >= 1.0 m (the pre-coupling-model region) and 1-9 m (without the unexplained 9-10 m return);
+    ``corr_1_9m_61bin`` at 39 cm smoothing. All median-normalised on their own region."""
     m = tg["mask"]; r = tg["range_m"]; A = db(env); G = db(tg["env"])
-    A = A - np.median(A[m]); G = G - np.median(G[m])
-    near = m & (r >= 0.3) & (r < 4.0); far = m & (r >= 4.0)
-    return dict(rmse_db=float(np.sqrt(((A - G)[m] ** 2).mean())), corr_all=_pearson(A[m], G[m]), corr_0p3_4m=_pearson(A[near], G[near]), corr_4_9p9m=_pearson(A[far], G[far]),
-                rmse_db_0p3_4m=float(np.sqrt(((A - G)[near] ** 2).mean())), rmse_db_4_9p9m=float(np.sqrt(((A - G)[far] ** 2).mean())))
+    def c(mm, w=1):
+        a = _smooth_rows(A, w)[mm]; g = _smooth_rows(G, w)[mm]; a = a - np.median(a); g = g - np.median(g)
+        return _pearson(a, g), float(np.sqrt(((a - g) ** 2).mean()))
+    An = A - np.median(A[m]); Gn = G - np.median(G[m])
+    near = m & (r >= 0.3) & (r < 4.0); far = m & (r >= 4.0); ge1 = m & (r >= 1.0); mid = m & (r >= 1.0) & (r < 9.0)
+    return dict(rmse_db=float(np.sqrt(((An - Gn)[m] ** 2).mean())), corr_all=_pearson(An[m], Gn[m]), corr_0p3_4m=_pearson(An[near], Gn[near]), corr_4_9p9m=_pearson(An[far], Gn[far]),
+                rmse_db_0p3_4m=float(np.sqrt(((An - Gn)[near] ** 2).mean())), rmse_db_4_9p9m=float(np.sqrt(((An - Gn)[far] ** 2).mean())),
+                corr_ge1m=c(ge1)[0], rmse_db_ge1m=c(ge1)[1], corr_1_9m=c(mid)[0], corr_1_9m_61bin=c(mid, 61)[0], corr_ge1m_61bin=c(ge1, 61)[0], first_bin=int(np.argmax(m)))
 
 
 def metrics_wifi(csi, tg):
@@ -86,14 +107,14 @@ def metrics_wifi(csi, tg):
 
 def targets_np(targets):
     t = {"sfcw": {k: (v.cpu().numpy() if torch.is_tensor(v) else v) for k, v in targets["sfcw"].items() if k in ("rp_mean", "mask", "range_m", "xcorr")},
-         "uwb": {k: v.cpu().numpy() for k, v in targets["uwb"].items()},
+         "uwb": {k: v.cpu().numpy() for k, v in targets["uwb"].items() if torch.is_tensor(v)},
          "wifi": {k: {kk: vv.cpu().numpy() for kk, vv in d.items()} for k, d in targets["wifi"].items()}}
     return t
 
 
-def render_all(band, cloud, mat, sensors, targets):
+def render_all(band, cloud, mat, sensors, targets, nuisance=None):
     with torch.no_grad():
-        _, r = MB.band_loss(band, cloud, mat, sensors, targets)
+        _, r = MB.band_loss(band, cloud, mat, sensors, targets, nuisance=nuisance)
     if band == "sfcw": return r["rp"].cpu().numpy()
     if band == "uwb": return r["env"].cpu().numpy()
     return {k: v.cpu().numpy() for k, v in r["csi"].items()}
@@ -155,18 +176,24 @@ def cmd_fit(a):
     for kind, seed in plan:
         B = set_bounds(kind); tag = f"{band}_{kind}_s{seed}"
         print(f"=== {tag}: V={a.voxels} steps={a.steps} bounds={B}", flush=True)
-        res, grid, abcd, cloud, sensors, targets = MB.fit((band,), dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=tag, gains=not a.no_gains, gain_l2=a.gain_l2, patience=a.patience)
+        res, grid, abcd, cloud, sensors, targets = MB.fit((band,), dev, a.points, a.steps, a.lr, a.voxels, a.tv, seed, tag=tag, gains=not a.no_gains, gain_l2=a.gain_l2, patience=a.patience,
+                                                          **MB.fit_kwargs(a))
+        nuis = res.pop("nuis")
         tnp = targets_np(targets)
         mat0 = dict(abcd=torch.tensor(ITU_GT["concrete"], dtype=torch.float64, device=dev).expand(cloud["xyz"].shape[0], 4).contiguous(), rho=None)
         mat1 = grid.material_at(cloud["xyz"])
-        r0 = render_all(band, cloud, mat0, MB.sensors_without_gains(sensors), targets); r1 = render_all(band, cloud, mat1, sensors, targets)
+        nuis0 = None
+        if band in nuis:                                   # iteration-0 nuisance state (gain / floor at their init), not the trained one
+            nuis0 = MB.BandNuisance(band, dev, a.noise_model == "on", a.coupling == "on"); nuis0.init(cloud, mat0, MB.sensors_without_gains(sensors), targets)
+        r0 = render_all(band, cloud, mat0, MB.sensors_without_gains(sensors), targets, nuis0); r1 = render_all(band, cloud, mat1, sensors, targets, nuis.get(band))
         m0 = metrics(band, r0, tnp); m1 = metrics(band, r1, tnp)
         gm = gain_metrics(res.get("gains"), tnp["sfcw"]) if band == "sfcw" else dict(enabled=False)
         res = dict(res); res.update(bounds=kind, bounds_values={k: (list(v) if isinstance(v, tuple) else v) for k, v in B.items()}, metrics_iter0=m0, metrics_trained=m1,
                    dispersion=MB.dispersion_summary(abcd), loss_iter0=res["start"][band], loss_trained=res["end"][band], gain_metrics=gm)
         res.pop("log", None)
         json.dump(res, open(os.path.join(OUT, tag + ".json"), "w"), indent=1)
-        save = dict(xyz=cloud["xyz"].cpu().numpy(), abcd=abcd)
+        save = dict(xyz=cloud["xyz"].cpu().numpy(), abcd=abcd, mask=tnp[band]["mask"] if band != "wifi" else np.zeros(0))
+        if isinstance(grid, MB.PerPointMaterial): save["physics"] = MB.physics_columns(mat1, MB.BAND_FC_GHZ[band])
         if gm.get("enabled"):
             save.update(gain_tx_db=np.asarray(gm["tx_db"]), gain_rx_db=np.asarray(gm["rx_db"]), gt_gain_tx_db=np.asarray(gm["gt_tx_db"]), gt_gain_rx_db=np.asarray(gm["gt_rx_db"]))
         if band == "wifi":
@@ -210,12 +237,12 @@ def fig_sfcw(tnp, z, tag, path):
         ax[0, j].set_title(f"|rp| per pair, dB rel. median\n{t}", fontsize=10); ax[0, j].set_xlabel("range [m]"); ax[0, j].set_ylabel("Tx-Rx pair (tx-major)")
         plt.colorbar(im, ax=ax[0, j], label="dB")
         ax[1, j].plot(r, G.mean(0), "k", lw=1.5, label="GT"); ax[1, j].plot(r, X.mean(0), "r" if j else "k", lw=1.2, label=t if j else None)
-        ax[1, j].set_xlabel("range [m]"); ax[1, j].set_ylabel("pair-mean dB rel. median"); ax[1, j].set_title("pair-mean range profile (bins 24-93 = 0.9-3.5 m)"); ax[1, j].grid(alpha=.3); ax[1, j].legend(fontsize=8)
+        ax[1, j].set_xlabel("range [m]"); ax[1, j].set_ylabel("pair-mean dB rel. median"); ax[1, j].set_title(f"pair-mean range profile (supervised bins {int(np.argmax(m))}-93 = {r.min():.2f}-{r.max():.2f} m)"); ax[1, j].grid(alpha=.3); ax[1, j].legend(fontsize=8)
     im = ax[0, 3].imshow(A1 - G, aspect="auto", origin="lower", extent=[r[0], r[-1], 0, 400], vmin=-10, vmax=10, cmap="coolwarm"); plt.colorbar(im, ax=ax[0, 3], label="dB")
     ax[0, 3].set_title("residual: trained - GT [dB]"); ax[0, 3].set_xlabel("range [m]"); ax[0, 3].set_ylabel("pair")
     ax[1, 3].plot(r, A0.mean(0) - G.mean(0), "C0", label="iter 0 - GT"); ax[1, 3].plot(r, A1.mean(0) - G.mean(0), "C3", label="trained - GT"); ax[1, 3].axhline(0, color="k", lw=.5)
     ax[1, 3].set_xlabel("range [m]"); ax[1, 3].set_ylabel("dB"); ax[1, 3].set_title("pair-mean residual"); ax[1, 3].grid(alpha=.3); ax[1, 3].legend(fontsize=8)
-    fig.suptitle(f"SFCW (Vayyar, node_1, Scene 1): GT vs rendered at iter 0 vs trained — {tag}, voxel-grid ITU field V=64, tight bounds; bins < 0.9 m masked (node near-field)", fontsize=12)
+    fig.suptitle(f"SFCW (Vayyar, node_1, Scene 1): GT vs rendered at iter 0 vs trained — {tag}: per-point 3DPS material, learned noise floor + coupling block (4DPS models), tight ITU bounds; supervised from {r.min():.2f} m", fontsize=12)
     fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
@@ -229,11 +256,11 @@ def fig_uwb(tnp, z, tag, path):
             a = ax[i, j]
             if j: a.plot(r, G, "k", lw=0.8, alpha=0.5, label="GT")
             a.plot(r, X, c, lw=0.9, label=t); a.set_xlim(lo, hi); a.set_ylim(-45, 25); a.set_xlabel("range [m] (bin 6.43 mm; 7-bin on-board delay removed)"); a.set_ylabel("log envelope, dB rel. masked median")
-            a.set_title(f"UWB envelope {lo}-{hi} m: {t}"); a.grid(alpha=.3); a.legend(fontsize=8); a.axvspan(0, 0.29, color="0.85")
+            a.set_title(f"UWB envelope {lo}-{hi} m: {t}"); a.grid(alpha=.3); a.legend(fontsize=8); a.axvspan(0, r[np.argmax(m)], color="0.85")
     for i, (lo, hi) in enumerate(((0.3, 9.9), (0.3, 4.0))):
         a = ax[i, 3]; a.plot(r, A0 - G, "C0", lw=0.7, label="iter 0 - GT"); a.plot(r, A1 - G, "C3", lw=0.7, label="trained - GT"); a.axhline(0, color="k", lw=.5)
         a.set_xlim(lo, hi); a.set_ylim(-30, 30); a.set_xlabel("range [m]"); a.set_ylabel("dB"); a.set_title(f"residual {lo}-{hi} m"); a.grid(alpha=.3); a.legend(fontsize=8)
-    fig.suptitle(f"UWB (X4M200, node_1): GT vs rendered at iter 0 vs trained — {tag}; measured pulse template; guard 0.29 m", fontsize=12)
+    fig.suptitle(f"UWB (X4M200, node_1): GT vs rendered at iter 0 vs trained — {tag}; measured pulse template; per-point material, learned noise floor + coupling block; supervised from {r[np.argmax(m)]:.2f} m (grey)", fontsize=12)
     fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
@@ -287,28 +314,37 @@ def fig_material(band, z, run, tag, path):
     d = run["dispersion"][f"{f}GHz"]
     ax[2].text(0.02, 0.98, f"eps' median {d['eps_median']:.2f} [p5 {d['eps_p05']:.2f}, p95 {d['eps_p95']:.2f}]\nsigma median {d['sigma_median']:.3f} [p5 {d['sigma_p05']:.3f}, p95 {d['sigma_p95']:.3f}] S/m\nbounds: {run['bounds']} {run['bounds_values']}",
                transform=ax[2].transAxes, va="top", fontsize=8.5, family="monospace")
-    fig.suptitle(f"{band.upper()}: fitted ITU material field ({tag})", fontsize=12); fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    fig.suptitle(f"{band.upper()}: fitted material ({tag}; {run.get('material', 'grid')})", fontsize=12); fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
 def cmd_figures(a):
     os.makedirs(VIZ, exist_ok=True)
-    dev = torch.device("cpu"); targets = MB.load_targets(dev); tnp = targets_np(targets)
+    dev = torch.device("cpu")
+    # the figures' masks follow the runs: first supervised bin of the best tight run per band (the coupling model opens the near bins)
+    g = {}
+    for band in ("sfcw", "uwb"):
+        runs_ = load_runs(band); bt_ = best_tight(band, runs_) if runs_ else None
+        g[band] = (runs_[bt_].get("guards", {}) or {}).get(band) if bt_ else None
+    targets = MB.load_targets(dev, sfcw_guard=g["sfcw"] if g["sfcw"] is not None else MB.GUARD_LO_SFCW, uwb_guard=g["uwb"]); tnp = targets_np(targets)
     README = [f"# Single-modality training check (render_vs_gt_{_TAG})", "",
-              "Each band is fitted ALONE (its own target only) with the voxel-grid ITU material field of `4DPS/mm4DPS/octonet_fit_multiband.py` "
-              "(V = 64 voxels per axis over the calibrated scaffold, 20k scaffold points, Adam lr 0.03, TV 1e-3, up to 400 steps), under TIGHT bounds "
+              "Each band is fitted ALONE (its own target only) with `4DPS/mm4DPS/octonet_fit_multiband.py`: the 3DPS per-point six-parameter material "
+              "(eps from a per-point ITU (a, c) at the band centre with the exponents frozen, sigma_h / l_c / tau / thickness per point in the 3DPS raw space; "
+              "20k scaffold points, Adam lr 0.03, L2 0.05 to the init, 400 steps), the ported 4DPS receiver noise floor (measured held-out envelope prior x "
+              "learned scale x 8-coefficient DCT range correction, added in power) and the ported 4DPS coupling block (coherent near-bin mean of held-out "
+              "recordings, added after a learned absolute gain where it reproduces the target; the guard stays elsewhere), under TIGHT ITU bounds "
               "(a ∈ [1,15], b ∈ ±0.1, c ≤ 0.1 S/m, d ≤ 1.0) for 3 seeds, plus one LOOSE run (b ±0.2, c ≤ 2, d ≤ 1.5). "
-              "'iter 0' = the grid's initialisation = uniform ITU concrete. Losses are the bands' median-normalised log-magnitude L1 "
-              "(SFCW: pair-wise range profiles, bins < 0.9 m masked as node near-field, xcorr-weighted; UWB: log-envelope, guard 0.29 m, reliability-weighted; "
-              "WiFi: log|CSI| per receiver/antenna/subcarrier, 6 HT40 notches masked, magnitude only). Metrics are computed on the same masked, median-normalised "
-              "dB quantities. Figures: `<band>_gt_iter0_trained.png`, `<band>_material.png`. Produced by `mm4DPS/octonet_eval_panels.py`.", ""]
-    summary = ["| band | loss iter 0 | loss trained (tight, 3 seeds) | loss trained (loose, 1 seed) | dB RMSE iter 0 → trained | corr iter 0 → trained | steps / runtime |", "|---|---|---|---|---|---|---|"]
+              "'iter 0' = uniform ITU concrete with the iteration-0 gain and floor. SFCW/UWB losses are log-magnitude L1 in absolute units "
+              "(SFCW: pair-wise range profiles, xcorr-weighted, 20+20 channel gains; UWB: log-envelope, reliability-weighted); WiFi keeps the median-normalised "
+              "magnitude-only loss (6 HT40 notches masked). Metrics are computed on the masked, median-normalised dB quantities (so they are comparable with v2/v3). "
+              "Figures: `<band>_gt_iter0_trained.png`, `<band>_material.png`. Produced by `mm4DPS/octonet_eval_panels.py`.", ""]
+    summary = ["| band | loss iter 0 | loss trained (tight, 3 seeds) | loss trained (loose, 1 seed) | dB RMSE iter 0 → trained (SFCW ≥ 0.9 m, UWB ≥ 1 m) | corr iter 0 → trained (SFCW pair image ≥ 0.9 m, ceiling 0.89; UWB envelope ≥ 1 m, ceiling 0.95; WiFi all) | steps / runtime |", "|---|---|---|---|---|---|---|"]
     captions = []
     for band in BANDS:
         runs = load_runs(band)
         if not runs: README.append(f"## {band.upper()}: no runs found"); continue
         tight = [v for v in runs.values() if v["bounds"] == "tight"]; loose = [v for v in runs.values() if v["bounds"] == "loose"]
         bt = best_tight(band, runs); z = np.load(os.path.join(OUT, bt + ".npz")); run = runs[bt]
-        mk = {"sfcw": ("rmse_db", "corr_image"), "uwb": ("rmse_db", "corr_all"), "wifi": None}[band]
+        mk = {"sfcw": ("rmse_db_far", "corr_image_far"), "uwb": ("rmse_db_ge1m", "corr_ge1m"), "wifi": None}[band]
         def M(r, which, key):
             m = r[which]; return m["all"][key] if band == "wifi" else m[key]
         k_r, k_c = ("rmse_db", "corr") if band == "wifi" else mk
@@ -318,16 +354,16 @@ def cmd_figures(a):
         README += [f"## {band.upper()}", "", f"Best tight seed: `{bt}` (loss {run['loss_trained']:.4f}). Figures: `{band}_gt_iter0_trained.png`, `{band}_material.png`.", ""]
         # per-band table
         if band == "sfcw":
-            README += ["| run | gains | loss iter0 → trained | dB RMSE (pairs × bins) | image corr | per-pair corr (median) | pair-mean profile corr / RMSE dB | gain std tx/rx dB (GT) | gain corr tx / rx / pairs |", "|---|---|---|---|---|---|---|---|---|"]
+            README += ["| run | gains | loss iter0 → trained | dB RMSE (pairs × bins) | image corr (all supervised bins) | image corr ≥ 0.9 m fine / 19 cm (ceiling 0.89 / 0.95) | per-pair corr (median) | pair-mean profile corr / RMSE dB | gain std tx/rx dB (GT) | gain corr tx / rx / pairs |", "|---|---|---|---|---|---|---|---|---|---|"]
             for k, v in runs.items():
                 a, b = v["metrics_iter0"], v["metrics_trained"]; g = v.get("gain_metrics", {}) or {}
                 gcell = (f"{g['tx_std_db']:.2f}/{g['rx_std_db']:.2f} ({g['gt_tx_std_db']:.2f}/{g['gt_rx_std_db']:.2f}) | {g['corr_tx']:.2f} / {g['corr_rx']:.2f} / {g['corr_pairs']:.2f}" if g.get("enabled") else "— | —")
-                README.append(f"| {k} | {'yes' if g.get('enabled') else 'no'} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['rmse_db']:.2f} → {b['rmse_db']:.2f} | {a['corr_image']:.3f} → {b['corr_image']:.3f} | {a['corr_pair_median']:.3f} → {b['corr_pair_median']:.3f} | {a['corr_pair_mean_profile']:.3f} → {b['corr_pair_mean_profile']:.3f} / {a['rmse_db_pair_mean_profile']:.2f} → {b['rmse_db_pair_mean_profile']:.2f} | {gcell} |")
+                README.append(f"| {k} | {'yes' if g.get('enabled') else 'no'} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['rmse_db']:.2f} → {b['rmse_db']:.2f} | {a['corr_image']:.3f} → {b['corr_image']:.3f} | {a.get('corr_image_far', float('nan')):.3f} → **{b.get('corr_image_far', float('nan')):.3f}** / {b.get('corr_image_far_5bin', float('nan')):.3f} | {a['corr_pair_median']:.3f} → {b['corr_pair_median']:.3f} | {a['corr_pair_mean_profile']:.3f} → {b['corr_pair_mean_profile']:.3f} / {a['rmse_db_pair_mean_profile']:.2f} → {b['rmse_db_pair_mean_profile']:.2f} | {gcell} |")
         elif band == "uwb":
-            README += ["| run | loss iter0 → trained | dB RMSE (masked) | corr all | corr 0.3–4 m | corr 4–9.9 m | RMSE dB 0.3–4 / 4–9.9 m |", "|---|---|---|---|---|---|---|"]
+            README += ["| run | loss iter0 → trained | dB RMSE (masked) | corr all supervised | corr ≥ 1 m fine / 39 cm (ceiling 0.95 / 0.98) | corr 1–9 m fine / 39 cm | corr 0.3–4 m | corr 4–9.9 m | RMSE dB 0.3–4 / 4–9.9 m |", "|---|---|---|---|---|---|---|---|---|"]
             for k, v in runs.items():
                 a, b = v["metrics_iter0"], v["metrics_trained"]
-                README.append(f"| {k} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['rmse_db']:.2f} → {b['rmse_db']:.2f} | {a['corr_all']:.3f} → {b['corr_all']:.3f} | {a['corr_0p3_4m']:.3f} → {b['corr_0p3_4m']:.3f} | {a['corr_4_9p9m']:.3f} → {b['corr_4_9p9m']:.3f} | {a['rmse_db_0p3_4m']:.2f} → {b['rmse_db_0p3_4m']:.2f} / {a['rmse_db_4_9p9m']:.2f} → {b['rmse_db_4_9p9m']:.2f} |")
+                README.append(f"| {k} | {v['loss_iter0']:.4f} → {v['loss_trained']:.4f} | {a['rmse_db']:.2f} → {b['rmse_db']:.2f} | {a['corr_all']:.3f} → {b['corr_all']:.3f} | {a.get('corr_ge1m', float('nan')):.3f} → **{b.get('corr_ge1m', float('nan')):.3f}** / {b.get('corr_ge1m_61bin', float('nan')):.3f} | {b.get('corr_1_9m', float('nan')):.3f} / {b.get('corr_1_9m_61bin', float('nan')):.3f} | {a['corr_0p3_4m']:.3f} → {b['corr_0p3_4m']:.3f} | {a['corr_4_9p9m']:.3f} → {b['corr_4_9p9m']:.3f} | {a['rmse_db_0p3_4m']:.2f} → {b['rmse_db_0p3_4m']:.2f} / {a['rmse_db_4_9p9m']:.2f} → {b['rmse_db_4_9p9m']:.2f} |")
         else:
             README += ["| run | loss iter0 → trained | dB RMSE all | corr all | Rx-1 RMSE / corr | Rx-2 | Rx-3 | Rx-4 (NLOS) |", "|---|---|---|---|---|---|---|---|"]
             for k, v in runs.items():
@@ -347,24 +383,31 @@ def cmd_figures(a):
                    f"nearest ITU class: {d['nearest_itu_class']}.", ""]
         if band == "sfcw":
             fig_sfcw(tnp, z, bt, os.path.join(VIZ, "sfcw_gt_iter0_trained.png"))
-            captions.append("sfcw_gt_iter0_trained.png: SFCW pair-wise |range profile| (dB, median-normalised, bins 0.9-3.5 m) and the pair-mean profile: GT pooled target vs rendered at iter 0 (uniform concrete) vs trained (SFCW alone, tight bounds, 3DPS head + per-channel gains); last column = residual.")
+            captions.append("sfcw_gt_iter0_trained.png: SFCW pair-wise |range profile| (dB, median-normalised, all supervised bins) and the pair-mean profile: GT pooled target vs rendered at iter 0 (uniform concrete, iteration-0 gain/floor) vs trained (SFCW alone, per-point 3DPS material + channel gains + learned noise floor + coupling block, tight ITU bounds); last column = residual.")
             if run.get("gain_metrics", {}).get("enabled"):
                 fig_gains(tnp, z, run, bt, os.path.join(VIZ, "sfcw_gains.png"))
                 captions.append("sfcw_gains.png: the fitted 20 per-Tx and 20 per-Rx log-amplitude gains (dB) of the SFCW-alone fit vs the gains implied by the GT's per-pair median levels (additive tx + rx decomposition), and the 400-pair gain pattern fitted vs GT.")
         elif band == "uwb":
             fig_uwb(tnp, z, bt, os.path.join(VIZ, "uwb_gt_iter0_trained.png"))
-            captions.append("uwb_gt_iter0_trained.png: UWB log-envelope (0.3-9.9 m and 0.3-4 m zoom): GT pooled vs rendered iter 0 vs trained (UWB alone); measured pulse template, on-board delay removed; last column = residual.")
+            captions.append("uwb_gt_iter0_trained.png: UWB log-envelope (0.3-9.9 m and 0.3-4 m zoom): GT pooled vs rendered iter 0 vs trained (UWB alone, per-point material + learned noise floor + coupling block); measured pulse template, on-board delay removed; last column = residual.")
         else:
             fig_wifi(tnp, z, bt, os.path.join(VIZ, "wifi_gt_iter0_trained.png"))
             captions.append("wifi_gt_iter0_trained.png: WiFi |CSI| per receiver and antenna (dB, median-normalised, notches masked): GT pooled vs rendered iter 0 vs trained (WiFi alone); last column = residual.")
         fig_material(band, z, run, bt, os.path.join(VIZ, f"{band}_material.png"))
         captions.append(f"{band}_material.png: fitted ITU field of the {band.upper()}-alone fit at {f} GHz (eps', sigma top-down) and the nearest-ITU-class histogram.")
     README[4:4] = ["## Summary (tight bounds, mean ± std over 3 seeds)", ""] + summary + [""]
-    README += ["## Reproduce", "", "```", "source tools/env_node.sh && cd 4DPS",
-               "CUDA_VISIBLE_DEVICES=3 python -m mm4DPS.octonet_eval_panels fit --band sfcw --seeds 0,1,2 --steps 400 --voxels 64 --loose",
-               "CUDA_VISIBLE_DEVICES=4 python -m mm4DPS.octonet_eval_panels fit --band uwb  --seeds 0,1,2 --steps 400 --voxels 64 --loose",
-               "CUDA_VISIBLE_DEVICES=5 python -m mm4DPS.octonet_eval_panels fit --band wifi --seeds 0,1,2 --steps 400 --voxels 64 --loose",
-               "python -m mm4DPS.octonet_eval_panels figures", "```", ""]
+    guards = {}
+    for band in ("sfcw", "uwb"):
+        runs = load_runs(band); bt = best_tight(band, runs) if runs else None
+        if bt: guards[band] = runs[bt].get("guards", {}).get(band); 
+    README += ["## Model state of these runs", "", f"Material / nuisances of the best tight runs: " + "; ".join(
+        f"{b}: material {runs_[bt_]['material']}, noise model {'on' if runs_[bt_].get('noise_model') else 'off'}, coupling {'on' if runs_[bt_].get('coupling') else 'off'}, first supervised bin {runs_[bt_].get('guards', {}).get(b)}, nuisance {json.dumps(runs_[bt_].get('nuisance', {}).get(b))}"
+        for b in ("sfcw", "uwb") for runs_ in [load_runs(b)] for bt_ in [best_tight(b, runs_)] if bt_), ""]
+    README += ["## Reproduce", "", "```", "source tools/env_node.sh && cd 4DPS", "python -m mm4DPS.octonet_noise measure        # held-out envelope + coupling (once)",
+               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=3 python -m mm4DPS.octonet_eval_panels fit --band sfcw --seeds 0,1,2 --steps 400 --loose",
+               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=4 python -m mm4DPS.octonet_eval_panels fit --band uwb  --seeds 0,1,2 --steps 400 --loose",
+               f"OCTONET_PANELS_TAG={_TAG} CUDA_VISIBLE_DEVICES=5 python -m mm4DPS.octonet_eval_panels fit --band wifi --seeds 0,1,2 --steps 400 --loose",
+               f"OCTONET_PANELS_TAG={_TAG} python -m mm4DPS.octonet_eval_panels figures", "```", ""]
     open(os.path.join(VIZ, "README.md"), "w").write("\n".join(README) + "\n")
     open(os.path.join(VIZ, "captions.txt"), "w").write("\n".join(captions) + "\n")
     print("\n".join(summary))
@@ -378,6 +421,7 @@ def main(argv=None):
     f.add_argument("--no-gains", action="store_true", help="SFCW: do not fit the 20+20 per-channel gains (pre-D13 behaviour)")
     f.add_argument("--gain-l2", type=float, default=0.01, help="L2 weight on the SFCW log-amplitude channel gains")
     f.add_argument("--patience", type=int, default=0, help="stop when the best loss has not improved for N steps (0 = run all --steps; the panels use all steps)")
+    MB.add_model_args(f)
     sub.add_parser("figures")
     a = ap.parse_args(argv)
     {"fit": cmd_fit, "figures": cmd_figures}[a.cmd](a)

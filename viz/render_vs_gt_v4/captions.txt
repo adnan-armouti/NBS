@@ -1,0 +1,7 @@
+sfcw_gt_iter0_trained.png: SFCW pair-wise |range profile| (dB, median-normalised, all supervised bins) and the pair-mean profile: GT pooled target vs rendered at iter 0 (uniform concrete, iteration-0 gain/floor) vs trained (SFCW alone, per-point 3DPS material + channel gains + learned noise floor + coupling block, tight ITU bounds); last column = residual.
+sfcw_gains.png: the fitted 20 per-Tx and 20 per-Rx log-amplitude gains (dB) of the SFCW-alone fit vs the gains implied by the GT's per-pair median levels (additive tx + rx decomposition), and the 400-pair gain pattern fitted vs GT.
+sfcw_material.png: fitted ITU field of the SFCW-alone fit at 65.0 GHz (eps', sigma top-down) and the nearest-ITU-class histogram.
+uwb_gt_iter0_trained.png: UWB log-envelope (0.3-9.9 m and 0.3-4 m zoom): GT pooled vs rendered iter 0 vs trained (UWB alone, per-point material + learned noise floor + coupling block); measured pulse template, on-board delay removed; last column = residual.
+uwb_material.png: fitted ITU field of the UWB-alone fit at 7.0 GHz (eps', sigma top-down) and the nearest-ITU-class histogram.
+wifi_gt_iter0_trained.png: WiFi |CSI| per receiver and antenna (dB, median-normalised, notches masked): GT pooled vs rendered iter 0 vs trained (WiFi alone); last column = residual.
+wifi_material.png: fitted ITU field of the WIFI-alone fit at 5.18 GHz (eps', sigma top-down) and the nearest-ITU-class histogram.

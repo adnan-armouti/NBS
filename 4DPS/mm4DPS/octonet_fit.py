@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from mm4DPS import octonet_heads as OH
+from mm4DPS import octonet_noise as ON
 from method import sfcw_target as ST
 from method.freq_material import ITU_GT
 from preprocessing import octonet_config as C, octonet_scene as S, vayyar_radar_config as VR
@@ -42,7 +43,7 @@ def load_target(path: str, device, guard_lo: int | None = None) -> dict:
     t = {k: torch.as_tensor(z[k]) for k in z.files}
     t["rp_mean"] = t["rp_mean"].to(torch.complex128).to(device); t["mask"] = t["mask"].bool().to(device)
     g = GUARD_LO if guard_lo is None else guard_lo
-    if g: t["mask"][:g] = False
+    t["mask"][:ON.NEAR_BINS["sfcw"]] = True; t["mask"][:g] = False
     for k in ("rel", "xcorr", "snr_db"):
         if k in t: t[k] = t[k].double().to(device)
     return t
@@ -93,38 +94,44 @@ def fit_static(args) -> dict:
     opt = torch.optim.Adam(groups)
     log = []; t0 = time.time()
 
-    # optional additive noise floor on |rp| (learned, one scalar, relative to the render's masked median): the raw Vayyar
-    # profiles never fall below the receiver noise, the render does; without it the log-magnitude loss fits the floor with material
-    log_floor = torch.tensor(-3.0, dtype=torch.float64, device=dev, requires_grad=bool(args.floor))
-    if args.floor: groups.append({"params": [log_floor], "lr": args.lr}); opt = torch.optim.Adam(groups)
-    msk = tgt_pool["mask"].to(dev)
+    # the ported 4DPS nuisances (mm4DPS.octonet_noise): learned receiver noise floor (measured held-out envelope prior, added in
+    # power) and the coherent near-field coupling block, both in absolute units behind a learned log gain; the loss is then
+    # un-normalised. Off = the scale-free median-normalised loss with the near guard.
+    use_nuis = args.noise_model == "on" or args.coupling == "on"
+    floor = ON.LearnedNoiseFloor.load("sfcw", dev) if args.noise_model == "on" else None
+    block = ON.CouplingBlock.load("sfcw", dev) if (args.coupling == "on" and ON.coupling_available("sfcw")) else None
+    log_gain = torch.zeros(1, dtype=torch.float64, device=dev, requires_grad=use_nuis)
+    if use_nuis:
+        with torch.no_grad():
+            rp_init = OH.sfcw_head(cloud, {"raw6": raw6}, sensor); m_far = tgt_pool["mask"].clone(); m_far[:ON.NEAR_BINS["sfcw"]] = False
+            log_gain.copy_(ON.init_log_gain(rp_init.abs(), tgt_pool["rp_mean"].abs(), m_far))
+            if floor is not None: floor.init_scale(float((tgt_pool["rp_mean"].abs()[:, m_far] ** 2).flatten().quantile(0.05)))
+        groups.append({"params": [log_gain] + (list(floor.parameters()) if floor is not None else []), "lr": args.lr}); opt = torch.optim.Adam(groups)
 
     def render(r6, gt, gr, tr=None):
         cl = cloud
         if args.refine_range > 0 and tr is not None:
             cl = dict(cloud, xyz=cloud["xyz"] + (args.refine_range * torch.tanh(tr))[:, None] * ray)
         rp = OH.sfcw_head(cl, {"raw6": r6}, dict(sensor, gain_tx=torch.exp(gt), gain_rx=torch.exp(gr)), detach_phase=not (args.refine_range > 0))
-        if args.floor:
-            mag = rp.abs(); fl = torch.exp(log_floor) * mag[:, msk].median().detach()
-            rp = rp * ((mag + fl) / (mag + 1e-30))
-        return rp
+        return ON.apply_sfcw(rp, log_gain, block, floor) if use_nuis else rp
 
     with torch.no_grad():
         rp0 = render(raw6, g_tx, g_rx, theta_r)
-        l0_pool, pb0_pool = ST.sfcw_static_loss(rp0, tgt_pool, kind="logmag", weight="xcorr")
-        l0_sit, pb0_sit = ST.sfcw_static_loss(rp0, tgt_sit, kind="logmag", weight="xcorr")
+        l0_pool, pb0_pool = ST.sfcw_static_loss(rp0, tgt_pool, kind="logmag", weight="xcorr", normalize=not use_nuis)
+        l0_sit, pb0_sit = ST.sfcw_static_loss(rp0, tgt_sit, kind="logmag", weight="xcorr", normalize=not use_nuis)
     print(f"points {n}; before: loss pool {float(l0_pool):.4f}, sit {float(l0_sit):.4f}; render {time.time() - t0:.1f} s")
-    best = (float(l0_pool), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), 0, theta_r.detach().clone())
+    def _nuis_state(): return (log_gain.detach().clone(), (floor.state_dict() if floor is not None else None))
+    best = (float(l0_pool), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), 0, theta_r.detach().clone(), _nuis_state())
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
         rp = render(raw6, g_tx, g_rx, theta_r)
-        loss_data, _ = ST.sfcw_static_loss(rp, tgt_pool, kind="logmag", weight="xcorr")
+        loss_data, _ = ST.sfcw_static_loss(rp, tgt_pool, kind="logmag", weight="xcorr", normalize=not use_nuis)
         reg = args.l2 * ((raw6 - raw0) ** 2).mean() + args.gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean()) + (args.refine_l2 * (theta_r ** 2).mean() if args.refine_range > 0 else 0.0)
         loss = loss_data + reg
         loss.backward(); opt.step()
         log.append(dict(step=step, loss=float(loss), data=float(loss_data), reg=float(reg), t=time.time() - t0))
         if float(loss_data) < best[0]:
-            best = (float(loss_data), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), step, theta_r.detach().clone())
+            best = (float(loss_data), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), step, theta_r.detach().clone(), _nuis_state())
         if step % 10 == 0 or step == 1:
             ph = reparameterize_torch(raw6.detach())
             print(f"  step {step:4d} loss {float(loss):.4f} (data {float(loss_data):.4f} reg {float(reg):.4f}) eps' [{float(ph[:,0].min()):.2f},{float(ph[:,0].max()):.2f}] sigma_h med {float(ph[:,2].median())*1e3:.3f} mm gains [{float(g_tx.min()):+.2f},{float(g_tx.max()):+.2f}] {time.time() - t0:.0f} s")
@@ -132,9 +139,11 @@ def fit_static(args) -> dict:
             print("  converged"); break
     raw_b, gt_b, gr_b, tr_b = best[1], best[2], best[3], best[5]
     with torch.no_grad():
+        log_gain.copy_(best[6][0])
+        if floor is not None: floor.load_state_dict(best[6][1])
         rp1 = render(raw_b, gt_b, gr_b, tr_b)
-        l1_pool, pb1_pool = ST.sfcw_static_loss(rp1, tgt_pool, kind="logmag", weight="xcorr")
-        l1_sit, pb1_sit = ST.sfcw_static_loss(rp1, tgt_sit, kind="logmag", weight="xcorr")
+        l1_pool, pb1_pool = ST.sfcw_static_loss(rp1, tgt_pool, kind="logmag", weight="xcorr", normalize=not use_nuis)
+        l1_sit, pb1_sit = ST.sfcw_static_loss(rp1, tgt_sit, kind="logmag", weight="xcorr", normalize=not use_nuis)
         physics = reparameterize_torch(raw_b).cpu().numpy()
     rho = physics[:, 0]                                   # eps' per point (the figure's colour; name kept for the plotting code)
     def _img(rp, tg):
@@ -144,7 +153,7 @@ def fit_static(args) -> dict:
         m = tg["mask"].cpu().numpy(); a = 20 * np.log10(np.abs(rp.cpu().numpy()) + 1e-300); b = 20 * np.log10(np.abs(tg["rp_mean"].cpu().numpy()) + 1e-300)
         k = np.ones(wdw) / wdw; a = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, a)[:, m]; b = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, b)[:, m]
         return float(np.corrcoef((a - np.median(a)).ravel(), (b - np.median(b)).ravel())[0, 1])
-    print(f"image corr smoothed 5 bins: pool {_img_s(rp1, tgt_pool, 5):.3f}, held sit {_img_s(rp1, tgt_sit, 5):.3f}; floor {float(torch.exp(log_floor)) if args.floor else 0:.4f} x median")
+    print(f"image corr smoothed 5 bins: pool {_img_s(rp1, tgt_pool, 5):.3f}, held sit {_img_s(rp1, tgt_sit, 5):.3f}; gain {float(log_gain):+.3f} log; floor {json.dumps(floor.summary()) if floor is not None else 'off'}; coupling {('from bin %d' % block.adopt_from_bin) if block is not None else 'off'}")
     _m = tgt_pool["mask"].cpu().numpy(); _r = tgt_pool["range_m"].cpu().numpy()
     _res = 20 * np.log10(np.abs(rp1.cpu().numpy()) + 1e-300) - 20 * np.log10(np.abs(tgt_pool["rp_mean"].cpu().numpy()) + 1e-300); _res -= np.median(_res[:, _m])
     for lo in np.arange(0.5, 3.75, 0.5):
@@ -208,7 +217,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("fit-static")
     s.add_argument("--scaffold-dir", default=None, help=f"scaffold stage dir (default {SCAFFOLD_DIR})")
-    s.add_argument("--floor", action="store_true", help="learn one additive noise floor on |rp| (relative to the render median)")
+    s.add_argument("--noise-model", default="on", choices=("on", "off"), help="learned receiver noise floor (4DPS model; prior from `octonet_noise measure`)")
+    s.add_argument("--coupling", default="on", choices=("on", "off"), help="coherent near-field coupling block (4DPS model) where adopted, else the bin < 24 guard")
     s.add_argument("--guard-lo", type=int, default=GUARD_LO, help="mask range bins below this (default 24 = 0.9 m: the node's own near-field return)")
     s.add_argument("--points", type=int, default=30000); s.add_argument("--steps", type=int, default=300)
     s.add_argument("--lr", type=float, default=0.05); s.add_argument("--l2", type=float, default=0.1)
@@ -219,7 +229,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "fit-static":
         if getattr(a, 'scaffold_dir', None): globals()['SCAFFOLD_DIR'] = a.scaffold_dir
-    globals()['GUARD_LO'] = a.guard_lo
+    globals()['GUARD_LO'] = a.guard_lo if a.guard_lo != GUARD_LO else ON.guard_bins("sfcw", a.coupling == "on")
     fit_static(a); return 0
 
 

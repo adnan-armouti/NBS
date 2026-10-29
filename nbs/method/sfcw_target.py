@@ -146,9 +146,11 @@ def _pairs_to_txrx_torch(rp: torch.Tensor) -> torch.Tensor:
     return r if C.VAY_PAIR_ORDER == "tx_major" else r.transpose(0, 1)
 
 
-def sfcw_static_loss(rp_render: torch.Tensor, target: dict, kind: str = "logmag", weight: str = "rel", n_az: int = 128):
-    """Masked, reliability-weighted L1 on normalised log-magnitude. Returns (scalar, per-bin residual (K,)).
-    ``rp_render``: (400,100) complex range profiles from the renderer (already range-compressed)."""
+def sfcw_static_loss(rp_render: torch.Tensor, target: dict, kind: str = "logmag", weight: str = "rel", n_az: int = 128, normalize: bool = True):
+    """Masked, reliability-weighted L1 on log-magnitude. Returns (scalar, per-bin residual (K,)).
+    ``rp_render``: (400,100) complex range profiles from the renderer (already range-compressed).
+    ``normalize``: subtract each side's masked median (scale-free; the default). False when the render carries an
+    absolute gain and additive terms in product units (noise floor, coupling block: mm4DPS.octonet_noise)."""
     mask = target["mask"].to(rp_render.device)
     w = target.get(weight, None)
     w = torch.ones(mask.numel(), device=rp_render.device) if w is None else w.to(rp_render.device)
@@ -162,7 +164,8 @@ def sfcw_static_loss(rp_render: torch.Tensor, target: dict, kind: str = "logmag"
     else:
         raise ValueError(kind)
     la = torch.log(a.abs() + EPS); lb = torch.log(b.abs() + EPS)
-    la = la - la[:, mask].median(); lb = lb - lb[:, mask].median()
+    if normalize:
+        la = la - la[:, mask].median(); lb = lb - lb[:, mask].median()
     res = (la - lb).abs()                                          # (P or n_az, K)
     per_bin = res.mean(0)
     loss = (per_bin * w).sum() / (w.sum() + EPS)
