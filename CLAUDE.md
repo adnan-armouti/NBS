@@ -27,7 +27,7 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   copy to edit. Never touch `/data/mmsd/4DPS*` or `/data/mmsd/datasets` on the node.
 - Never `pkill -f <pattern>` from a Bash call whose own command line contains the pattern.
 - No multibounce / image-method rendering proposals.
-- Keep the SFCW math single-sourced in `nbs/method/sfcw_forward.py`; the 4DPS copy imports it.
+- SFCW rendering is single-sourced in the 3DPS rasterizer (`nbs/mm3DPS/rasterizer_factorized.py`, SFCW mode); `nbs/method/sfcw_forward.py` is only the point-target reference of `sfcw_migration_selftest` (T23).
 
 ## Measured truths (trust these over the paper / repo card)
 - Vayyar pickle = dict `{timestamps, data}`, `data (400,100,T)` complex128, **3.1 Hz** frame rate; range
@@ -70,6 +70,11 @@ velocity field and micro-Doppler loss are NOT used (see `docs/prompts/port_4dps_
   yet**. Known limits: WiFi Tx/Rx schematic (measure them), UWB pose assumed, ITU bounds saturate in the tails
   (tighten d≤1.0, c≤0.1 S/m or use a class prior). Bounded per-point ρ (0.590) is not comparable to the ITU-bounded
   grid (0.72–0.80): the former has ±26 dB of freedom, the latter ~12 dB.
+- **SFCW head rule (T23, 2026-10-28): `octonet_heads.sfcw_head` IS the 3DPS rasterizer (`mm3DPS.rasterizer_factorized.
+  render_factorized`, Jones BSDF with the six material parameters, antenna pattern, hemisphere weight, detached phase)
+  on the Vayyar SFCW config; the pre-T23 point sum is `sfcw_head_pointsum_deprecated` and raises. Never render SFCW
+  with `sfcw_forward.render_sfcw_pairs` outside `sfcw_migration_selftest`. Findings checklist:
+  `docs/findings/sfcw_head_vs_3dps.md` (strike items only with a measurement).**
 - **Project goal (user, 2026-10-28): train on ONE modality (two jointly only as a lower-preference alternative) and
   evaluate ZERO-SHOT transfer to the other bands.** Single-modality training check: `viz/render_vs_gt_v2/README.md`
   (T19). Geometry videos: `viz/geometry_v2/` (mp4s git-ignored, on workstation + node).

@@ -27,7 +27,7 @@ Using the coupling term in a fit (octonet_fit would do):
     coup = SC.coupling_sweep_mean(fit)                  # (400,100) complex, temporal mean of the fitted tones
     target = ST.sfcw_static_target(V, guard_lo=4)       # RAW target (not decoupled), smaller guard
     ...
-    H = OH.sfcw_channel(cloud, material, sensor)        # (20,20,100) rendered sweep
+    H = OH.sfcw_channel_pointsum_deprecated(cloud, material, sensor)        # (20,20,100) rendered sweep
     rp = SC.range_compress(SC.add_coupling(H, coup))    # render + measured coupling, same window
     loss, _ = ST.sfcw_static_loss(rp, target, kind='logmag', weight='xcorr')
 
@@ -210,7 +210,7 @@ def refit(tgt_pool: dict, tgt_single: dict, win: str = "hann", coupling_add: tor
     rho_of = lambda th: torch.exp(math.log(rho_max) * torch.tanh(th))
     coup = None if coupling_add is None else coupling_add.to(dev)
     def render(th):
-        H = OH.sfcw_channel(cloud, dict(abcd=abcd, rho=rho_of(th)), sensor, chunk=chunk)
+        H = OH.sfcw_channel_pointsum_deprecated(cloud, dict(abcd=abcd, rho=rho_of(th)), sensor, chunk=chunk)
         if coup is not None: H = add_coupling(H, coup)
         return range_compress(H, win).reshape(-1, K)
     t0 = time.time()

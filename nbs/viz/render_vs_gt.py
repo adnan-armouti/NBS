@@ -83,13 +83,14 @@ def sfcw():
     pcl = load_or_build_scaffold()
     R1, radar, _ = S.camera_pose(1); bore = R1[:, 2].copy(); bore[2] = 0.0; bore /= np.linalg.norm(bore)   # radar shares node_1 camera yaw (assumption), horizontal
     cfg = VR.build_config(radar_pos=radar, boresight=bore)
-    tx = torch.tensor([a["pos_mm"] for a in cfg["tx_array"]], dtype=torch.float64, device=DEV) / 1000
-    rx = torch.tensor([a["pos_mm"] for a in cfg["rx_array"]], dtype=torch.float64, device=DEV) / 1000
     pos = torch.tensor(pcl, dtype=torch.float64, device=DEV)
     abcd = torch.tensor(ITU_GT["concrete"], dtype=torch.float64, device=DEV).expand(len(pcl), 4)
     with torch.no_grad():
-        Hr = SF.render_sfcw_pairs(abcd, pos, tx, rx, freqs, geom_mode="monostatic")   # (20,20,100)
-        rp_r = SF.sfcw_to_range(Hr).cpu()
+        # T23: the SFCW head IS the 3DPS rasterizer (Jones BSDF, antenna pattern, hemisphere weight); normals from the
+        # scaffold when present, else facing the radar
+        from mm4DPS import octonet_heads as OH
+        cloud = {"xyz": pos[:, :3], "normals": pos[:, 3:6] if pos.shape[1] >= 6 else None}
+        rp_r = OH.sfcw_head(cloud, {"abcd": abcd}, dict(pos=radar, boresight=bore)).cpu().reshape(20, 20, VR.N_FREQ)
     prof_r = rp_r.abs().reshape(-1, VR.N_FREQ).mean(0).numpy(); prof_r[~guard] = np.nan
     ra_r = RA.vayyar_to_ra_complex(rp_r, n_az=128).abs().numpy(); ra_r[:, ~guard] = np.nan
     # azimuth axis of the Tx ULA
@@ -114,7 +115,7 @@ def sfcw():
     a.set_title("GT static RA |.| (elevation marginalized)"); plt.colorbar(im, ax=a, label="dB")
     a = ax[1, 0]; a.plot(r_axis, db(np.nan_to_num(prof_r, nan=0)), lw=1.4, color="C1")
     a.axvline(SUBJECT_R, color="r", ls="--", lw=1); a.set_ylim(DB_FLOOR, 1); a.set_xlabel("range (m)"); a.set_ylabel("|range profile| (dB rel. max)")
-    a.set_title(f"rendered ({POSE_LABEL}, uniform material)\nsfcw_forward.render_sfcw_pairs on the static scaffold, mean over 400 pairs"); a.grid(alpha=.3)
+    a.set_title(f"rendered ({POSE_LABEL}, uniform concrete)\n3DPS render_factorized head (T23) on the static scaffold, mean over 400 pairs"); a.grid(alpha=.3)
     a = ax[1, 1]; a.scatter(sx, sy, s=1, c=pcl[:, 2], cmap="coolwarm"); a.scatter([0], [0], marker="^", c="k", s=80, label="Vayyar (node_1)")
     a.scatter([0], [SUBJECT_R], marker="x", c="r", s=60, label="subject spot"); a.set_aspect("equal"); a.set_xlabel("azimuth x (m, radar frame)"); a.set_ylabel("boresight y (m)")
     a.set_title(f"scaffold rendered ({len(pcl)} pts, colour = height)"); a.legend(loc="lower right"); a.grid(alpha=.3)

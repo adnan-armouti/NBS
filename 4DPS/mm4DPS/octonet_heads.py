@@ -18,7 +18,7 @@ Shared input convention (what ``mm4DPS.octonet`` produces from the scaffold + ca
                Wi-Fi: dict(tx (3,), rx {k: (3,)}, los {k: bool}) [world, schematic +-0.5 m]
 
 The SFCW math is single-sourced in nbs/method/sfcw_forward.py (reflectivity, geometry, phase);
-``sfcw_head`` only vectorises its per-pair loop and is asserted equal to it in ``selftest``.
+``sfcw_head`` is the 3DPS rasterizer (render_factorized) on the Vayyar SFCW config (T23); the old point sum is deprecated.
 """
 from __future__ import annotations
 import argparse, math, os, sys
@@ -106,7 +106,8 @@ def sensor_from_extrinsics(ext: dict, key: str = "vayyar") -> dict:
 
 
 # ----------------------------------------------------------------------------- SFCW head
-def sfcw_channel(cloud: dict, material: dict, sensor: dict, chunk: int = 4096) -> torch.Tensor:
+def sfcw_channel_pointsum_deprecated(cloud: dict, material: dict, sensor: dict, chunk: int = 4096) -> torch.Tensor:
+    _deprecated_guard("sfcw_channel_pointsum_deprecated")
     """Monostatic SFCW channel H (20 Tx, 20 Rx, 100) complex128 -- the vectorised twin of
     ``sfcw_forward.render_sfcw_pairs(geom_mode='monostatic')``: reflectivity once per point at the
     backscatter direction toward the array centre (with the point's normal), per-pair path phase,
@@ -132,11 +133,116 @@ def sfcw_channel(cloud: dict, material: dict, sensor: dict, chunk: int = 4096) -
     return H
 
 
-def sfcw_head(cloud: dict, material: dict, sensor: dict, chunk: int = 4096) -> torch.Tensor:
+# ============================================================================ SFCW head = the 3DPS rasterizer (T23)
+# The SFCW head IS mm3DPS.rasterizer_factorized.render_factorized (Jones BSDF with the six material parameters, antenna
+# element patterns, the MC hemisphere weight, Hann range PSF, detached phase) on the Vayyar SFCW config built at the
+# calibrated pose. The only OctoNet-specific additions: epsilon from the ITU dispersion law at the band centre, a
+# datasheet stand-in antenna pattern, and the 20 + 20 per-channel gains of the raw Vayyar phasors. The earlier point-sum
+# head is kept only as `sfcw_head_pointsum_deprecated` and raises unless OCTONET_ALLOW_DEPRECATED_SFCW=1
+# (docs/findings/sfcw_head_vs_3dps.md).
+SFCW_FC_GHZ = 65.0
+SFCW_DEFAULT_ROUGHNESS = dict(sigma_h=1.0e-4, l_c=1.0e-2, tau=0.5, thickness=0.1)      # 3DPS physics units (m, m, -, m)
+VAYYAR_PATTERN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "nbs", "assets", "antenna_pattern", "VAYYAR")
+_SFCW_RAST = {}
+
+
+def _deprecated_guard(name: str):
+    if os.environ.get("OCTONET_ALLOW_DEPRECATED_SFCW") != "1":
+        raise RuntimeError(f"{name} is the pre-T23 point-sum SFCW model (no Jones BSDF, 1/R^4, no antenna gain, attached phase); "
+                           "it is wrong for surfaces at 65 GHz. Use octonet_heads.sfcw_head (3DPS render_factorized). "
+                           "Set OCTONET_ALLOW_DEPRECATED_SFCW=1 only for the historical comparison.")
+
+
+def write_vayyar_pattern(path: str, e_bw_deg: float = 180.0, h_bw_deg: float = 82.0, gmax_db: float = 5.8) -> np.ndarray:
+    """Datasheet stand-in element pattern in the 3DPS (361,2) [E_dB, H_dB] format: cos^p planes whose 3 dB beamwidths
+    are the IMAGEVK-74 values (E 180 deg, H 82 deg, 5.8 dBi). Replace with a measured pattern when one exists."""
+    ang = np.deg2rad(np.arange(361) - 180.0)
+    def plane(bw):
+        p = math.log(0.5) / math.log(math.cos(math.radians(bw / 2))) if bw < 179 else 0.05
+        return gmax_db + 10 * np.log10(np.clip(np.cos(ang), 1e-3, 1) ** p)
+    arr = np.stack([plane(e_bw_deg), plane(h_bw_deg)], 1).astype(np.float64)
+    os.makedirs(os.path.dirname(path), exist_ok=True); np.save(path, arr); return arr
+
+
+def vayyar_rasterizer(sensor: dict, device):
+    """The 3DPS Rasterizer for the Vayyar SFCW config at ``sensor['pos']`` / ``sensor['boresight']`` (cached per pose)."""
+    from mm3DPS import rasterizer as RZ
+    pos = np.round(np.asarray(sensor["pos"], float), 6); bore = np.asarray(sensor["boresight"], float); bore = bore / np.linalg.norm(bore)
+    key = (tuple(pos), tuple(np.round(bore, 6)), str(device))
+    if key not in _SFCW_RAST:
+        import json, hashlib
+        cfg = VR.build_config(radar_pos=pos, boresight=bore)
+        h = hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:10]
+        cfg_dir = os.path.join(os.environ.get("NBS_DATA_OUT", C.NBS_DATA_OUT), "sfcw_configs"); os.makedirs(cfg_dir, exist_ok=True)
+        cfg_path = os.path.join(cfg_dir, f"vayyar_sfcw_{h}.json")
+        if not os.path.exists(cfg_path):
+            json.dump(cfg, open(cfg_path, "w"), indent=1)
+        tx_pat = os.path.join(VAYYAR_PATTERN_DIR, "tx_65.npy"); rx_pat = os.path.join(VAYYAR_PATTERN_DIR, "rx_65.npy")
+        for pth in (tx_pat, rx_pat):
+            if not os.path.exists(pth):
+                write_vayyar_pattern(pth)
+        _SFCW_RAST[key] = RZ.Rasterizer(cfg_path, "/none.ply", tx_pat, rx_pat, device=str(device))
+    return _SFCW_RAST[key]
+
+
+def sfcw_physics(cloud: dict, material: dict, f_ghz: float = SFCW_FC_GHZ) -> torch.Tensor:
+    """The 3DPS six-parameter physics (M,6) = [eps_r, eps_i, sigma_h, l_c, tau, thickness] from the OctoNet material dict:
+    either ``raw6`` (3DPS raw space, through reparameterize_torch) or ``abcd`` (ITU dispersion -> eps at the band centre)
+    plus optional per-point ``sigma_h``/``l_c``/``tau``/``thickness`` (defaults SFCW_DEFAULT_ROUGHNESS)."""
+    from mm3DPS.rasterizer import reparameterize_torch
+    from method.freq_material import eps_from_dispersion
+    xyz = cloud["xyz"]; M = xyz.shape[0]; dev = xyz.device
+    if "raw6" in material:
+        return reparameterize_torch(material["raw6"].float())
+    if "rho" in material:
+        r = material["rho"]
+        if torch.is_tensor(r) and (r.detach() != 1).any():
+            raise ValueError("per-point 'rho' is not a 3DPS material parameter; optimise raw6 (eps, sigma_h, l_c, tau, thickness) or abcd")
+    er, ei = eps_from_dispersion(material["abcd"], f_ghz)
+    cols = [er.float(), ei.float()]
+    for k in ("sigma_h", "l_c", "tau", "thickness"):
+        v = material.get(k, None)
+        cols.append(v.float().expand(M) if torch.is_tensor(v) else torch.full((M,), float(SFCW_DEFAULT_ROUGHNESS[k] if v is None else v), device=dev))
+    return torch.stack(cols, 1)
+
+
+def sfcw_head(cloud: dict, material: dict, sensor: dict, chunk: int | None = None, detach_phase: bool = True,
+              use_cuda_kernels: bool = False, shadow_mask=None) -> torch.Tensor:
+    """SFCW pair-wise range profiles (400,100) complex128, tx-major, through the 3DPS rasterizer.
+
+    cloud    {xyz (N,3), normals (N,3)}  MoCap world, metres (normals are flipped toward the radar: two-sided points)
+    material {abcd (N,4) [+ sigma_h, l_c, tau, thickness]} or {raw6 (N,6)}; see sfcw_physics
+    sensor   {pos (3,), boresight (3,) [, gain_tx (20,), gain_rx (20,)]}  linear amplitude channel gains (default 1)
+    """
+    from mm3DPS.rasterizer_factorized import render_factorized
+    xyz = cloud["xyz"]; dev = xyz.device
+    rast = vayyar_rasterizer(sensor, dev)
+    pos = torch.as_tensor(sensor["pos"], dtype=torch.float64, device=dev)
+    w_in = pos[None, :] - xyz; nrm = cloud["normals"]
+    if nrm is None:
+        nrm = w_in / w_in.norm(dim=1, keepdim=True)
+    else:
+        flip = (nrm * w_in).sum(1, keepdim=True) < 0
+        nrm = torch.where(flip, -nrm, nrm)
+    physics = sfcw_physics(cloud, material)
+    areas = torch.ones(xyz.shape[0], device=dev, dtype=torch.float32)
+    rr, ri = render_factorized(xyz.float(), nrm.float(), areas, physics, rast, lambda phys: phys,
+                               detach_phase=detach_phase, shadow_mask=shadow_mask, use_cuda_kernels=use_cuda_kernels)
+    rp = torch.complex(rr.double(), ri.double()).reshape(rast.n_tx * rast.n_rx, rast.K)      # tx-major pairs
+    g_tx = sensor.get("gain_tx", None); g_rx = sensor.get("gain_rx", None)
+    if g_tx is not None or g_rx is not None:
+        g_tx = torch.ones(rast.n_tx, dtype=torch.float64, device=dev) if g_tx is None else _t(g_tx, dev)
+        g_rx = torch.ones(rast.n_rx, dtype=torch.float64, device=dev) if g_rx is None else _t(g_rx, dev)
+        rp = rp * (g_tx[:, None] * g_rx[None, :]).reshape(-1, 1).to(rp.dtype)
+    return rp
+
+
+def sfcw_head_pointsum_deprecated(cloud: dict, material: dict, sensor: dict, chunk: int = 4096) -> torch.Tensor:
+    _deprecated_guard("sfcw_head_pointsum_deprecated")
     """Pair-wise range profiles rp (400, 100) complex128 in the target's layout: Hann-windowed IFFT
     over the tones (``ra_utils.sfcw_range_compress``), pairs flattened tx-major (p = tx*20 + rx,
     ``octonet_config.VAY_PAIR_ORDER``)."""
-    H = sfcw_channel(cloud, material, sensor, chunk)
+    H = sfcw_channel_pointsum_deprecated(cloud, material, sensor, chunk)
     rp = RA.sfcw_range_compress(H)                                                        # (20,20,100)
     return rp.reshape(-1, rp.shape[-1])
 
@@ -239,25 +345,34 @@ def selftest(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> bo
         nonlocal ok; ok &= bool(cond); print(f"  [{'PASS' if cond else 'FAIL'}] {name} {detail}")
     pos0 = np.array([2.921, 0.011, 0.901]); bore = np.array([-1.0, 0.0, 0.0])
     sensor = dict(pos=pos0, boresight=bore)
-    # --- SFCW: equivalence with the NBS per-pair loop (50 random points with normals)
+    # --- SFCW (T23): the head IS render_factorized; the deprecated point sum must raise
+    try:
+        sfcw_head_pointsum_deprecated(_cloud([[0, 0, 0]], None, device), _material(1, device), sensor); raised = False
+    except RuntimeError:
+        raised = True
+    check("SFCW deprecated point-sum head raises", raised)
+    from mm3DPS.rasterizer_factorized import render_factorized
     rng = np.random.default_rng(0)
-    pts = pos0 + bore * rng.uniform(1.0, 3.5, (50, 1)) + rng.normal(0, 0.5, (50, 3)); nrm = rng.normal(size=(50, 3)); nrm /= np.linalg.norm(nrm, axis=1, keepdims=True)
-    cl = _cloud(pts, nrm, device); mat = _material(50, device)
-    tx, rx = vayyar_arrays(sensor, device)
-    H_ref = SF.render_sfcw_pairs(mat["abcd"], cl["xyz"], tx, rx, SFCW_FREQS_HZ, geom_mode="monostatic", normals=cl["normals"])
-    H_new = sfcw_channel(cl, mat, sensor, chunk=16)
-    rel = float((H_new - H_ref).abs().max() / H_ref.abs().max())
-    check("SFCW vectorised == NBS render_sfcw_pairs", rel < 1e-8, f"(max rel diff {rel:.2e})")
-    # --- SFCW: single target on boresight at 2.0 m -> bin 53; two targets resolved; gradient
+    cl = _cloud(rng.normal(size=(50, 3)) * 0.5 + pos0 + bore * 2.5, np.tile(-bore, (50, 1)), device); mat = _material(50, device, grad=True)
+    rast = vayyar_rasterizer(sensor, device)
+    rr, ri = render_factorized(cl["xyz"].float(), cl["normals"].float(), torch.ones(50, device=device), sfcw_physics(cl, mat), rast, lambda p: p, detach_phase=True, use_cuda_kernels=False)
+    H_ref = torch.complex(rr.double(), ri.double()).reshape(400, -1); H_new = sfcw_head(cl, mat, sensor)
+    rel = float((H_new - H_ref).abs().max() / H_ref.abs().max().clamp_min(1e-30))
+    check("SFCW head == direct render_factorized (Vayyar SFCW config, 3DPS physics)", rel < 1e-6, f"(max rel diff {rel:.2e})")
     for R0 in (2.0,):
-        cl1 = _cloud([pos0 + bore * R0], None, device); m1 = _material(1, device, grad=True)
+        cl1 = _cloud([pos0 + bore * R0], [-bore], device); m1 = _material(1, device, grad=True)
         rp = sfcw_head(cl1, m1, sensor); prof = rp.abs().mean(0); k = int(prof[3:-3].argmax()) + 3
         check(f"SFCW point target {R0} m -> bin {k} (expect {round(R0 / SFCW_BIN_M)})", abs(k - round(R0 / SFCW_BIN_M)) <= 1)
-        (prof.sum()).backward(); check("SFCW gradient flows to rho and abcd", m1["rho"].grad is not None and torch.isfinite(m1["rho"].grad).all() and m1["abcd"].grad is not None)
-    cl2 = _cloud([pos0 + bore * 1.5, pos0 + bore * 2.5], None, device); m2 = _material(2, device)
+        (prof.sum()).backward(); check("SFCW gradient flows to abcd", m1["abcd"].grad is not None and torch.isfinite(m1["abcd"].grad).all())
+    raw6 = torch.zeros(1, 6, dtype=torch.float32, device=device, requires_grad=True)
+    prof6 = sfcw_head(cl1, {"raw6": raw6}, sensor).abs().mean(0); prof6.sum().backward()
+    check("SFCW gradient flows to the six 3DPS raw parameters", raw6.grad is not None and torch.isfinite(raw6.grad).all() and float(raw6.grad.abs().sum()) > 0)
+    cl2 = _cloud([pos0 + bore * 1.5, pos0 + bore * 2.5], [-bore, -bore], device); m2 = _material(2, device)
     prof = sfcw_head(cl2, m2, sensor).abs().mean(0); pk = [int(prof[3:-3].argmax()) + 3]
-    prof2 = prof.clone(); prof2[max(pk[0] - 3, 0):pk[0] + 4] = 0; pk.append(int(prof2[3:-3].argmax()) + 3)
-    check("SFCW two targets 1.5/2.5 m resolved", sorted(pk) == sorted([round(1.5 / SFCW_BIN_M), round(2.5 / SFCW_BIN_M)]) or all(min(abs(p - round(r / SFCW_BIN_M)) for r in (1.5, 2.5)) <= 1 for p in pk), f"(bins {sorted(pk)}, expect {round(1.5/SFCW_BIN_M)},{round(2.5/SFCW_BIN_M)})")
+    prof2 = prof.clone(); prof2[max(pk[0] - 6, 0):pk[0] + 7] = 0; pk.append(int(prof2[3:-3].argmax()) + 3)
+    check("SFCW two targets 1.5/2.5 m resolved", all(min(abs(p - round(r / SFCW_BIN_M)) for r in (1.5, 2.5)) <= 1 for p in pk), f"(bins {sorted(pk)}, expect {round(1.5/SFCW_BIN_M)},{round(2.5/SFCW_BIN_M)})")
+    gsens = dict(sensor, gain_tx=np.full(20, 2.0), gain_rx=np.ones(20))
+    check("SFCW channel gains scale the pair image", abs(float(sfcw_head(cl2, m2, gsens).abs().sum() / sfcw_head(cl2, m2, sensor).abs().sum()) - 2.0) < 1e-6)
     # --- Wi-Fi: scatterer with Tx->p->Rx path 15 m, no LOS -> CIR tap 2 (7.5 m taps); gradient
     txp = np.array([2.0, -2.0, 0.9]); rxp = np.array([-2.0, 2.0, 0.9]); d = np.linalg.norm(rxp - txp)
     # point on the perpendicular bisector such that Rt + Rr = 15 m

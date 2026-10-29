@@ -3,8 +3,8 @@
     python -m mm4DPS.octonet_fit fit-static [--points 30000] [--steps 300] [--lr 0.05] [--l2 1e-2]
 
 Parametrisation (the NBS physics, per point): refl_m(f) = Fresnel(ITU concrete, cos_i_m, f) * rho_m,
-rho_m = rho_max^tanh(theta_m) a real per-point reflectivity scale (frequency-flat) bounded to
-[1/rho_max, rho_max] (default 20; --rho-max 0 for the unbounded exp(theta), which lets a handful of
+T23: the head is the 3DPS rasterizer; the state is the six-parameter 3DPS material per point + 39 channel gains
+(the former per-point rho model is gone; see docs/findings/sfcw_head_vs_3dps.md). Older text:
 points run to ~1000x and explain the profile alone). The ITU
 dispersion (a,b,c,d) stays fixed at concrete: with a 4 GHz band the per-point dispersion exponents
 are not identifiable from one static profile (the gate experiments in docs/WRITE_UP.md), whereas a
@@ -63,58 +63,69 @@ def db(x, floor=-60.0):
 
 
 def fit_static(args) -> dict:
+    """Static-scene SFCW material fit through the 3DPS rasterizer head (T23): per-point six-parameter 3DPS material
+    (eps_r, eps_i, sigma_h, l_c, tau, thickness in the 3DPS raw space, bounded by reparameterize_torch) plus the
+    20 + 20 per-channel log-amplitude gains of the raw Vayyar phasors. Loss = sfcw_static_loss(logmag, xcorr)."""
+    from mm3DPS.rasterizer import inverse_reparameterize_torch, reparameterize_torch
+    from method.freq_material import eps_from_dispersion
     dev = torch.device(args.device)
     torch.manual_seed(0)
     pcl, cloud, sensor = load_inputs(args.points, dev)
     tgt_pool = load_target(os.path.join(DATA_OUT, "sfcw_target_S1", "target_pool5.npz"), dev)
     tgt_sit = load_target(os.path.join(DATA_OUT, "sfcw_target_S1", "target_rec_sit.npz"), dev)
     n = len(pcl)
-    abcd = torch.tensor(ITU_GT["concrete"], dtype=torch.float64, device=dev).expand(n, 4).contiguous()
-    theta = torch.zeros(n, dtype=torch.float64, device=dev, requires_grad=True)
-    opt = torch.optim.Adam([theta], lr=args.lr)
+    abcd = torch.tensor(ITU_GT["concrete"], dtype=torch.float64)
+    er, ei = eps_from_dispersion(abcd, OH.SFCW_FC_GHZ)
+    phys0 = np.tile([float(er), float(ei), OH.SFCW_DEFAULT_ROUGHNESS["sigma_h"], OH.SFCW_DEFAULT_ROUGHNESS["l_c"],
+                     OH.SFCW_DEFAULT_ROUGHNESS["tau"], OH.SFCW_DEFAULT_ROUGHNESS["thickness"]], (n, 1))
+    raw0 = torch.as_tensor(inverse_reparameterize_torch(phys0), dtype=torch.float32, device=dev)
+    raw6 = raw0.clone().requires_grad_(True)
+    g_tx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=True)
+    g_rx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=True)
+    opt = torch.optim.Adam([{"params": [raw6], "lr": args.lr}, {"params": [g_tx, g_rx], "lr": args.lr}])
     log = []; t0 = time.time()
 
-    def rho_of(th):
-        return torch.exp(th) if args.rho_max <= 0 else torch.exp(math.log(args.rho_max) * torch.tanh(th))
-
-    def render(th):
-        return OH.sfcw_head(cloud, dict(abcd=abcd, rho=rho_of(th)), sensor, chunk=args.chunk)
+    def render(r6, gt, gr):
+        return OH.sfcw_head(cloud, {"raw6": r6}, dict(sensor, gain_tx=torch.exp(gt), gain_rx=torch.exp(gr)))
 
     with torch.no_grad():
-        rp0 = render(theta)
+        rp0 = render(raw6, g_tx, g_rx)
         l0_pool, pb0_pool = ST.sfcw_static_loss(rp0, tgt_pool, kind="logmag", weight="xcorr")
         l0_sit, pb0_sit = ST.sfcw_static_loss(rp0, tgt_sit, kind="logmag", weight="xcorr")
     print(f"points {n}; before: loss pool {float(l0_pool):.4f}, sit {float(l0_sit):.4f}; render {time.time() - t0:.1f} s")
-    best = (float(l0_pool), theta.detach().clone(), 0)
+    best = (float(l0_pool), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), 0)
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
-        rp = render(theta)
+        rp = render(raw6, g_tx, g_rx)
         loss_data, _ = ST.sfcw_static_loss(rp, tgt_pool, kind="logmag", weight="xcorr")
-        reg = args.l2 * (theta ** 2).mean()
+        reg = args.l2 * ((raw6 - raw0) ** 2).mean() + args.gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean())
         loss = loss_data + reg
         loss.backward(); opt.step()
         log.append(dict(step=step, loss=float(loss), data=float(loss_data), reg=float(reg), t=time.time() - t0))
         if float(loss_data) < best[0]:
-            best = (float(loss_data), theta.detach().clone(), step)
+            best = (float(loss_data), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), step)
         if step % 10 == 0 or step == 1:
-            print(f"  step {step:4d} loss {float(loss):.4f} (data {float(loss_data):.4f} reg {float(reg):.4f}) rho [{float(rho_of(theta).min()):.3f},{float(rho_of(theta).max()):.3f}] {time.time() - t0:.0f} s")
+            ph = reparameterize_torch(raw6.detach())
+            print(f"  step {step:4d} loss {float(loss):.4f} (data {float(loss_data):.4f} reg {float(reg):.4f}) eps' [{float(ph[:,0].min()):.2f},{float(ph[:,0].max()):.2f}] sigma_h med {float(ph[:,2].median())*1e3:.3f} mm gains [{float(g_tx.min()):+.2f},{float(g_tx.max()):+.2f}] {time.time() - t0:.0f} s")
         if step >= 50 and len(log) > 30 and abs(log[-1]["data"] - log[-31]["data"]) < 1e-4:
             print("  converged"); break
-    theta_b = best[1]
+    raw_b, gt_b, gr_b = best[1], best[2], best[3]
     with torch.no_grad():
-        rp1 = render(theta_b)
+        rp1 = render(raw_b, gt_b, gr_b)
         l1_pool, pb1_pool = ST.sfcw_static_loss(rp1, tgt_pool, kind="logmag", weight="xcorr")
         l1_sit, pb1_sit = ST.sfcw_static_loss(rp1, tgt_sit, kind="logmag", weight="xcorr")
-    rho = rho_of(theta_b).cpu().numpy()
-    print(f"after (best step {best[2]}): loss pool {float(l1_pool):.4f}, sit {float(l1_sit):.4f}; rho median {np.median(rho):.3f} [{rho.min():.3f},{rho.max():.3f}]; {time.time() - t0:.0f} s")
+        physics = reparameterize_torch(raw_b).cpu().numpy()
+    rho = physics[:, 0]                                   # eps' per point (the figure's colour; name kept for the plotting code)
+    print(f"after (best step {best[4]}): loss pool {float(l1_pool):.4f}, sit {float(l1_sit):.4f}; eps' median {np.median(rho):.2f} [{rho.min():.2f},{rho.max():.2f}], sigma_h median {np.median(physics[:,2])*1e3:.3f} mm; gains tx std {float(gt_b.std()):.3f} rx std {float(gr_b.std()):.3f}; {time.time() - t0:.0f} s")
+    theta_b = raw_b
     out = os.path.join(DATA_OUT, "fit_S1_sfcw"); os.makedirs(out, exist_ok=True)
-    np.savez(os.path.join(out, "material.npz"), xyz=pcl[:, :3], normals=pcl[:, 3:6], rho=rho, theta=theta_b.cpu().numpy(), abcd=np.asarray(ITU_GT["concrete"]))
+    np.savez(os.path.join(out, "material.npz"), xyz=pcl[:, :3], normals=pcl[:, 3:6], physics=physics, raw6=theta_b.cpu().numpy(), gain_tx=gt_b.cpu().numpy(), gain_rx=gr_b.cpu().numpy(), physics_columns=np.array(["eps_r", "eps_i", "sigma_h", "l_c", "tau", "thickness"]))
     mask = tgt_pool["mask"].cpu().numpy(); rng_m = tgt_pool["range_m"].cpu().numpy()
-    summary = dict(points=n, steps=len(log), best_step=best[2], loss_before=dict(pool=float(l0_pool), sit=float(l0_sit)),
-                   loss_after=dict(pool=float(l1_pool), sit=float(l1_sit)), rho=dict(median=float(np.median(rho)), min=float(rho.min()), max=float(rho.max()), p05=float(np.percentile(rho, 5)), p95=float(np.percentile(rho, 95))),
+    summary = dict(points=n, steps=len(log), best_step=best[4], head="3DPS render_factorized (T23)", gains=dict(tx=gt_b.cpu().numpy().tolist(), rx=gr_b.cpu().numpy().tolist()), loss_before=dict(pool=float(l0_pool), sit=float(l0_sit)),
+                   loss_after=dict(pool=float(l1_pool), sit=float(l1_sit)), eps_r=dict(median=float(np.median(rho)), min=float(rho.min()), max=float(rho.max()), p05=float(np.percentile(rho, 5)), p95=float(np.percentile(rho, 95))), sigma_h_mm_median=float(np.median(physics[:, 2]) * 1e3),
                    per_bin_before_pool=np.nan_to_num(pb0_pool.cpu().numpy(), nan=-1).tolist(), per_bin_after_pool=np.nan_to_num(pb1_pool.cpu().numpy(), nan=-1).tolist(),
                    per_bin_before_sit=np.nan_to_num(pb0_sit.cpu().numpy(), nan=-1).tolist(), per_bin_after_sit=np.nan_to_num(pb1_sit.cpu().numpy(), nan=-1).tolist(),
-                   seconds=time.time() - t0, args=vars(args), log=log, parametrisation=("refl = Fresnel(ITU concrete, cos_i, f) * rho, rho = exp(theta)" if args.rho_max <= 0 else f"refl = Fresnel(ITU concrete, cos_i, f) * rho, rho = rho_max^tanh(theta), rho in [1/{args.rho_max}, {args.rho_max}]") + "; loss logmag xcorr-weighted + l2 mean(theta^2)")
+                   seconds=time.time() - t0, args=vars(args), log=log, parametrisation="3DPS render_factorized: six-parameter Jones material per point (raw space, reparameterize_torch bounds) + 20+20 log-amplitude channel gains; loss logmag xcorr-weighted + l2 on (raw - raw0) + gain_l2")
     json.dump(summary, open(os.path.join(out, "fit_log.json"), "w"), indent=1)
     figure(pcl, rho, rp0.cpu(), rp1.cpu(), tgt_pool, tgt_sit, summary, sensor)
     return summary
@@ -144,14 +155,14 @@ def figure(pcl, rho, rp0, rp1, tgt_pool, tgt_sit, summary, sensor):
         a.plot(r, g + 25 * i, "k", lw=1); a.plot(r, q + 25 * i, "C3", lw=1); a.text(r[8], 25 * i + 8, f"pair {pidx} (tx {pidx // 20}, rx {pidx % 20})", fontsize=8)
     a.set_xlabel("range (m)"); a.set_ylabel("log|rp| dB (offset per pair)"); a.set_title("individual pairs: GT (black) vs fitted render (red)"); a.grid(alpha=.3)
     a = ax[1, 1]
-    sc = a.scatter(pcl[:, 0], pcl[:, 1], c=np.log10(rho), s=1.5, cmap="coolwarm", vmin=-1.3, vmax=1.3)
-    a.plot(*sensor["pos"][:2], "k^", ms=10); a.plot(0, 0, "k*", ms=9); a.set_aspect("equal"); a.set_xlabel("X [m]"); a.set_ylabel("Y [m]"); a.set_title("fitted per-point log10(rho) (top-down, MoCap frame)"); plt.colorbar(sc, ax=a, label="log10 rho")
+    sc = a.scatter(pcl[:, 0], pcl[:, 1], c=rho, s=1.5, cmap="coolwarm", vmin=-1.3, vmax=1.3)
+    a.plot(*sensor["pos"][:2], "k^", ms=10); a.plot(0, 0, "k*", ms=9); a.set_aspect("equal"); a.set_xlabel("X [m]"); a.set_ylabel("Y [m]"); a.set_title("fitted per-point eps' (65 GHz) (top-down, MoCap frame)"); plt.colorbar(sc, ax=a, label="eps'")
     a = ax[1, 2]
     rr = np.linalg.norm(pcl[:, :3] - sensor["pos"], axis=1); hb = np.arange(0, 7.5, 0.1); idx = np.digitize(rr, hb)
     med = [np.median(np.log10(rho[idx == k])) if (idx == k).sum() > 5 else np.nan for k in range(1, len(hb))]
     a.plot(hb[:-1] + 0.05, med, "C3"); a.axvspan(0, r[mask][0], color="0.9"); a.axvspan(r[mask][-1], 7.5, color="0.9", label="outside the 3.71 m unambiguous range")
-    a.set_xlabel("point range from the radar (m)"); a.set_ylabel("median log10 rho"); a.set_title("fitted rho vs range (grey: bins the loss cannot see)"); a.grid(alpha=.3); a.legend(fontsize=8)
-    fig.suptitle(f"SFCW static fit, Scene 1, {summary['points']} scaffold points, {summary['steps']} Adam steps ({summary['seconds']:.0f} s) -- refl = Fresnel(concrete, cos_i, f) x rho_m (rho in [1/{summary['args']['rho_max']:g}, {summary['args']['rho_max']:g}]), loss on pair-wise range profiles only (RA axis unverified)", fontsize=11)
+    a.set_xlabel("point range from the radar (m)"); a.set_ylabel("median eps'"); a.set_title("fitted rho vs range (grey: bins the loss cannot see)"); a.grid(alpha=.3); a.legend(fontsize=8)
+    fig.suptitle(f"SFCW static fit, Scene 1, {summary['points']} scaffold points, {summary['steps']} Adam steps ({summary['seconds']:.0f} s) -- 3DPS render_factorized head (Jones BSDF, six parameters per point) + 39 channel gains; loss on pair-wise range profiles only (RA axis unverified)", fontsize=11)
     fig.tight_layout(); os.makedirs(VIZ_DIR, exist_ok=True); fig.savefig(os.path.join(VIZ_DIR, "sfcw_fit_static.png"), dpi=150); plt.close(fig)
     with open(os.path.join(VIZ_DIR, "captions.txt"), "a") as f:
         f.write(f"sfcw_fit_static.png: first end-to-end static SFCW fit (mm4DPS.octonet_fit) on the calibrated scaffold ({summary['points']} pts) with the sfcw_head; per-point reflectivity scale rho on ITU concrete; xcorr-weighted log|rp| loss on the pooled target {summary['loss_before']['pool']:.3f} -> {summary['loss_after']['pool']:.3f}, held single recording {summary['loss_before']['sit']:.3f} -> {summary['loss_after']['sit']:.3f}; rho median {summary['rho']['median']:.2f} [{summary['rho']['p05']:.2f},{summary['rho']['p95']:.2f}] (5-95 %). Radar pose = node_1 rigid body + camera yaw (assumption); uniform-pitch array (range only).\n")
@@ -166,7 +177,7 @@ def main(argv=None):
     s.add_argument("--points", type=int, default=30000); s.add_argument("--steps", type=int, default=300)
     s.add_argument("--lr", type=float, default=0.05); s.add_argument("--l2", type=float, default=0.1)
     s.add_argument("--chunk", type=int, default=4096); s.add_argument("--device", default="cuda")
-    s.add_argument("--rho-max", type=float, default=20.0, help="bound rho to [1/rho_max, rho_max] via tanh; <=0 = unbounded exp(theta)")
+    s.add_argument("--gain-l2", type=float, default=0.01, help="L2 on the 20+20 log-amplitude channel gains")
     a = ap.parse_args(argv)
     if a.cmd == "fit-static":
         if getattr(a, 'scaffold_dir', None): globals()['SCAFFOLD_DIR'] = a.scaffold_dir
