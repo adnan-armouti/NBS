@@ -83,40 +83,74 @@ def fit_static(args) -> dict:
     raw6 = raw0.clone().requires_grad_(True)
     g_tx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=True)
     g_rx = torch.zeros(20, dtype=torch.float64, device=dev, requires_grad=True)
-    opt = torch.optim.Adam([{"params": [raw6], "lr": args.lr}, {"params": [g_tx, g_rx], "lr": args.lr}])
+    # optional per-point range refinement along the radar ray, bounded to +-refine_range (the 8-bit depth quantisation is
+    # 3.9 cm, so +-2 cm is physically justified); with it the carrier phase is ATTACHED so speckle can be aligned
+    pos_t = torch.as_tensor(sensor["pos"], dtype=torch.float64, device=dev)
+    ray = cloud["xyz"] - pos_t; ray = ray / ray.norm(dim=1, keepdim=True)
+    theta_r = torch.zeros(n, dtype=torch.float64, device=dev, requires_grad=bool(args.refine_range > 0))
+    groups = [{"params": [raw6], "lr": args.lr}, {"params": [g_tx, g_rx], "lr": args.lr}]
+    if args.refine_range > 0: groups.append({"params": [theta_r], "lr": args.lr * args.refine_lr_scale})
+    opt = torch.optim.Adam(groups)
     log = []; t0 = time.time()
 
-    def render(r6, gt, gr):
-        return OH.sfcw_head(cloud, {"raw6": r6}, dict(sensor, gain_tx=torch.exp(gt), gain_rx=torch.exp(gr)))
+    # optional additive noise floor on |rp| (learned, one scalar, relative to the render's masked median): the raw Vayyar
+    # profiles never fall below the receiver noise, the render does; without it the log-magnitude loss fits the floor with material
+    log_floor = torch.tensor(-3.0, dtype=torch.float64, device=dev, requires_grad=bool(args.floor))
+    if args.floor: groups.append({"params": [log_floor], "lr": args.lr}); opt = torch.optim.Adam(groups)
+    msk = tgt_pool["mask"].to(dev)
+
+    def render(r6, gt, gr, tr=None):
+        cl = cloud
+        if args.refine_range > 0 and tr is not None:
+            cl = dict(cloud, xyz=cloud["xyz"] + (args.refine_range * torch.tanh(tr))[:, None] * ray)
+        rp = OH.sfcw_head(cl, {"raw6": r6}, dict(sensor, gain_tx=torch.exp(gt), gain_rx=torch.exp(gr)), detach_phase=not (args.refine_range > 0))
+        if args.floor:
+            mag = rp.abs(); fl = torch.exp(log_floor) * mag[:, msk].median().detach()
+            rp = rp * ((mag + fl) / (mag + 1e-30))
+        return rp
 
     with torch.no_grad():
-        rp0 = render(raw6, g_tx, g_rx)
+        rp0 = render(raw6, g_tx, g_rx, theta_r)
         l0_pool, pb0_pool = ST.sfcw_static_loss(rp0, tgt_pool, kind="logmag", weight="xcorr")
         l0_sit, pb0_sit = ST.sfcw_static_loss(rp0, tgt_sit, kind="logmag", weight="xcorr")
     print(f"points {n}; before: loss pool {float(l0_pool):.4f}, sit {float(l0_sit):.4f}; render {time.time() - t0:.1f} s")
-    best = (float(l0_pool), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), 0)
+    best = (float(l0_pool), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), 0, theta_r.detach().clone())
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
-        rp = render(raw6, g_tx, g_rx)
+        rp = render(raw6, g_tx, g_rx, theta_r)
         loss_data, _ = ST.sfcw_static_loss(rp, tgt_pool, kind="logmag", weight="xcorr")
-        reg = args.l2 * ((raw6 - raw0) ** 2).mean() + args.gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean())
+        reg = args.l2 * ((raw6 - raw0) ** 2).mean() + args.gain_l2 * ((g_tx ** 2).mean() + (g_rx ** 2).mean()) + (args.refine_l2 * (theta_r ** 2).mean() if args.refine_range > 0 else 0.0)
         loss = loss_data + reg
         loss.backward(); opt.step()
         log.append(dict(step=step, loss=float(loss), data=float(loss_data), reg=float(reg), t=time.time() - t0))
         if float(loss_data) < best[0]:
-            best = (float(loss_data), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), step)
+            best = (float(loss_data), raw6.detach().clone(), g_tx.detach().clone(), g_rx.detach().clone(), step, theta_r.detach().clone())
         if step % 10 == 0 or step == 1:
             ph = reparameterize_torch(raw6.detach())
             print(f"  step {step:4d} loss {float(loss):.4f} (data {float(loss_data):.4f} reg {float(reg):.4f}) eps' [{float(ph[:,0].min()):.2f},{float(ph[:,0].max()):.2f}] sigma_h med {float(ph[:,2].median())*1e3:.3f} mm gains [{float(g_tx.min()):+.2f},{float(g_tx.max()):+.2f}] {time.time() - t0:.0f} s")
         if step >= 50 and len(log) > 30 and abs(log[-1]["data"] - log[-31]["data"]) < 1e-4:
             print("  converged"); break
-    raw_b, gt_b, gr_b = best[1], best[2], best[3]
+    raw_b, gt_b, gr_b, tr_b = best[1], best[2], best[3], best[5]
     with torch.no_grad():
-        rp1 = render(raw_b, gt_b, gr_b)
+        rp1 = render(raw_b, gt_b, gr_b, tr_b)
         l1_pool, pb1_pool = ST.sfcw_static_loss(rp1, tgt_pool, kind="logmag", weight="xcorr")
         l1_sit, pb1_sit = ST.sfcw_static_loss(rp1, tgt_sit, kind="logmag", weight="xcorr")
         physics = reparameterize_torch(raw_b).cpu().numpy()
     rho = physics[:, 0]                                   # eps' per point (the figure's colour; name kept for the plotting code)
+    def _img(rp, tg):
+        m = tg["mask"].cpu().numpy(); a = 20 * np.log10(np.abs(rp.cpu().numpy())[:, m] + 1e-300); b = 20 * np.log10(np.abs(tg["rp_mean"].cpu().numpy())[:, m] + 1e-300)
+        return float(np.corrcoef((a - np.median(a)).ravel(), (b - np.median(b)).ravel())[0, 1])
+    def _img_s(rp, tg, wdw):
+        m = tg["mask"].cpu().numpy(); a = 20 * np.log10(np.abs(rp.cpu().numpy()) + 1e-300); b = 20 * np.log10(np.abs(tg["rp_mean"].cpu().numpy()) + 1e-300)
+        k = np.ones(wdw) / wdw; a = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, a)[:, m]; b = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, b)[:, m]
+        return float(np.corrcoef((a - np.median(a)).ravel(), (b - np.median(b)).ravel())[0, 1])
+    print(f"image corr smoothed 5 bins: pool {_img_s(rp1, tgt_pool, 5):.3f}, held sit {_img_s(rp1, tgt_sit, 5):.3f}; floor {float(torch.exp(log_floor)) if args.floor else 0:.4f} x median")
+    _m = tgt_pool["mask"].cpu().numpy(); _r = tgt_pool["range_m"].cpu().numpy()
+    _res = 20 * np.log10(np.abs(rp1.cpu().numpy()) + 1e-300) - 20 * np.log10(np.abs(tgt_pool["rp_mean"].cpu().numpy()) + 1e-300); _res -= np.median(_res[:, _m])
+    for lo in np.arange(0.5, 3.75, 0.5):
+        mm = _m & (_r >= lo) & (_r < lo + 0.5)
+        if mm.sum() > 2: print(f"    range {lo:.1f}-{lo+0.5:.1f} m: resid mean {_res[:, mm].mean():+.2f} dB, pair-std {_res[:, mm].std():.2f} dB, image corr {_img(rp1[:, mm] if False else rp1, dict(tgt_pool, mask=torch.as_tensor(mm))):.2f}, GT level {20*np.log10(np.abs(tgt_pool['rp_mean'].cpu().numpy())[:, mm]+1e-300).mean()-20*np.log10(np.abs(tgt_pool['rp_mean'].cpu().numpy())[:, _m]+1e-300).mean():+.1f} dB")
+    print(f"image corr: pool {_img(rp1, tgt_pool):.3f} (iter0 {_img(rp0, tgt_pool):.3f}), held sit {_img(rp1, tgt_sit):.3f}; range offsets std {float((args.refine_range * torch.tanh(tr_b)).std()) * 100 if args.refine_range > 0 else 0:.2f} cm")
     print(f"after (best step {best[4]}): loss pool {float(l1_pool):.4f}, sit {float(l1_sit):.4f}; eps' median {np.median(rho):.2f} [{rho.min():.2f},{rho.max():.2f}], sigma_h median {np.median(physics[:,2])*1e3:.3f} mm; gains tx std {float(gt_b.std()):.3f} rx std {float(gr_b.std()):.3f}; {time.time() - t0:.0f} s")
     theta_b = raw_b
     out = os.path.join(DATA_OUT, "fit_S1_sfcw"); os.makedirs(out, exist_ok=True)
@@ -166,7 +200,7 @@ def figure(pcl, rho, rp0, rp1, tgt_pool, tgt_sit, summary, sensor):
     fig.suptitle(f"SFCW static fit, Scene 1, {summary['points']} scaffold points, {summary['steps']} Adam steps ({summary['seconds']:.0f} s) -- 3DPS render_factorized head (Jones BSDF, six parameters per point) + 39 channel gains; loss on pair-wise range profiles only (RA axis unverified)", fontsize=11)
     fig.tight_layout(); os.makedirs(VIZ_DIR, exist_ok=True); fig.savefig(os.path.join(VIZ_DIR, "sfcw_fit_static.png"), dpi=150); plt.close(fig)
     with open(os.path.join(VIZ_DIR, "captions.txt"), "a") as f:
-        f.write(f"sfcw_fit_static.png: first end-to-end static SFCW fit (mm4DPS.octonet_fit) on the calibrated scaffold ({summary['points']} pts) with the sfcw_head; per-point reflectivity scale rho on ITU concrete; xcorr-weighted log|rp| loss on the pooled target {summary['loss_before']['pool']:.3f} -> {summary['loss_after']['pool']:.3f}, held single recording {summary['loss_before']['sit']:.3f} -> {summary['loss_after']['sit']:.3f}; rho median {summary['rho']['median']:.2f} [{summary['rho']['p05']:.2f},{summary['rho']['p95']:.2f}] (5-95 %). Radar pose = node_1 rigid body + camera yaw (assumption); uniform-pitch array (range only).\n")
+        f.write(f"sfcw_fit_static.png: static SFCW fit (mm4DPS.octonet_fit, 3DPS render_factorized head) on the calibrated scaffold ({summary['points']} pts): per-point six-parameter material + 39 channel gains; xcorr-weighted log|rp| loss on the pooled target {summary['loss_before']['pool']:.3f} -> {summary['loss_after']['pool']:.3f}, held single recording {summary['loss_before']['sit']:.3f} -> {summary['loss_after']['sit']:.3f}; eps' median {summary['eps_r']['median']:.2f} [{summary['eps_r']['p05']:.2f},{summary['eps_r']['p95']:.2f}]. Radar pose = node_1 rigid body + camera yaw (assumption).\n")
 
 
 def main(argv=None):
@@ -174,11 +208,14 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("fit-static")
     s.add_argument("--scaffold-dir", default=None, help=f"scaffold stage dir (default {SCAFFOLD_DIR})")
+    s.add_argument("--floor", action="store_true", help="learn one additive noise floor on |rp| (relative to the render median)")
     s.add_argument("--guard-lo", type=int, default=GUARD_LO, help="mask range bins below this (default 24 = 0.9 m: the node's own near-field return)")
     s.add_argument("--points", type=int, default=30000); s.add_argument("--steps", type=int, default=300)
     s.add_argument("--lr", type=float, default=0.05); s.add_argument("--l2", type=float, default=0.1)
     s.add_argument("--chunk", type=int, default=4096); s.add_argument("--device", default="cuda")
     s.add_argument("--gain-l2", type=float, default=0.01, help="L2 on the 20+20 log-amplitude channel gains")
+    s.add_argument("--refine-range", type=float, default=0.0, help="per-point along-ray range refinement bound in m (0 = off; 0.02 = the depth quantisation); attaches the phase")
+    s.add_argument("--refine-l2", type=float, default=0.1); s.add_argument("--refine-lr-scale", type=float, default=1.0)
     a = ap.parse_args(argv)
     if a.cmd == "fit-static":
         if getattr(a, 'scaffold_dir', None): globals()['SCAFFOLD_DIR'] = a.scaffold_dir

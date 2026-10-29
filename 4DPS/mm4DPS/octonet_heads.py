@@ -192,6 +192,8 @@ def sfcw_physics(cloud: dict, material: dict, f_ghz: float = SFCW_FC_GHZ) -> tor
     from mm3DPS.rasterizer import reparameterize_torch
     from method.freq_material import eps_from_dispersion
     xyz = cloud["xyz"]; M = xyz.shape[0]; dev = xyz.device
+    if "physics" in material:                                   # (M,6) physics directly (e.g. a saved fit)
+        return material["physics"].float()
     if "raw6" in material:
         return reparameterize_torch(material["raw6"].float())
     if "rho" in material:
